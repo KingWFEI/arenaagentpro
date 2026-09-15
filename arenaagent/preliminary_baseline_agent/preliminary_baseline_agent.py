@@ -15,6 +15,8 @@ from arenaagent.preliminary_baseline_agent.task_registry import create_task_stra
 from arenaagent.preliminary_baseline_agent.task_runtime import TaskContext, normalize_task_type
 from arenaagent.preliminary_baseline_agent.tasks.base import TaskStrategy
 from arenaagent.preliminary_baseline_agent.tasks.jigsaw.runner import run_dedicated_jigsaw
+from arenaagent.preliminary_baseline_agent.tasks.npc.runner import run_npc_fast_step
+from arenaagent.preliminary_baseline_agent.tasks.npc.strategy import NpcStrategy
 from arenaagent.preliminary_baseline_agent.tasks.raven.text_client import (
     build_raven_text_client_from_env,
 )
@@ -33,6 +35,7 @@ class PreliminaryBaselineAgent(VLMAgent):
     """Shared VLM runtime with isolated strategy state for each preliminary task."""
 
     _TIDYROOM_MAX_LOCAL_STEPS = 64
+    _NPC_MAX_LOCAL_STEPS = 6
     _TIDYROOM_POST_TURN_SETTLE_SECONDS = 0.25
     _TIDYROOM_POST_TURN_MAX_ATTEMPTS = 5
     _TIDYROOM_SEGMENTATION_GAP_RATIO = 0.20
@@ -91,6 +94,9 @@ class PreliminaryBaselineAgent(VLMAgent):
         if task_type == "raven":
             self._run_raven_subject_safely(subject)
             return
+        if task_type == "npc":
+            self._run_npc_subject_fast(subject)
+            return
         if task_type != "tidyroom":
             super()._run_subject()
             return
@@ -122,6 +128,63 @@ class PreliminaryBaselineAgent(VLMAgent):
             self._apply_action(self._execute_action_and_record(emergency))
 
         # 所有物品均已在提交前完成几何校验，可以立即通知赛题端评估。
+        self._evaluate_subject()
+    def _run_npc_subject_fast(
+        self, 
+        subject: dict[str, Any],
+    ) -> None:
+        """在单个本地循环中完成四名 NPC 访谈和最终文本判断。"""
+        task_response = self._get_response_from_task()
+        self.subject_finished = False
+
+        final_actions = {"submit_answer", "finish_task"}
+
+        logger.info(
+            "Using NPC fast loop (max_steps={})",
+            self._NPC_MAX_LOCAL_STEPS,
+        )
+
+        for local_step in range(1, self._NPC_MAX_LOCAL_STEPS + 1):
+            logger.debug("NPC fast-loop step {}", local_step)
+
+            action_result = self.run_step(subject, task_response)
+            action_name = self._last_executed_action_name
+
+            logger.debug(
+                "NPC fast-loop step {} finished action={}",
+                local_step,
+                action_name,
+            )
+
+                    # 最终答案只在这里向 Arena 上报一次。
+            if action_name in final_actions:
+                self._apply_action(action_result)
+                self.subject_finished = True
+                logger.info(
+                    "NPC fast loop finished with final action {}",
+                    action_name,
+                )
+                break
+
+            # speak_to_npc 已经通过 speak_to RPC 真正完成了访谈，
+            # 不再额外调用 update_action，也不进入 AgentBase 的 sleep。
+            if action_name == "speak_to_npc":
+                continue
+
+            # 正常 NPC fast path 理论上不会出现其他动作。
+            # 出现时停止快速循环，避免未知动作被无限重复。
+            logger.error(
+                "Unexpected action '{}' in NPC fast loop; aborting local loop",
+                action_name,
+            )
+            break
+
+        else:
+            logger.error(
+                "NPC fast loop exhausted {} steps without a final answer",
+                self._NPC_MAX_LOCAL_STEPS,
+            )
+
         self._evaluate_subject()
 
     def _run_raven_subject_safely(self, first_subject: dict[str, Any]) -> None:
@@ -230,6 +293,9 @@ class PreliminaryBaselineAgent(VLMAgent):
         strategy = self._ensure_task_strategy(subject)
         safe_subject = dict(subject) if isinstance(subject, dict) else {"subject": str(subject)}
         strategy.before_step(safe_subject, task_response)
+
+        if self._active_task_type == "npc" and isinstance(strategy, NpcStrategy):
+            return run_npc_fast_step(self, safe_subject, task_response, strategy)
 
         if self._active_task_type == "jigsaw" and self._jigsaw_attempt_subject_key != self._active_subject_key:
             self._jigsaw_attempt_subject_key = self._active_subject_key

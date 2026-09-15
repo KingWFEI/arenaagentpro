@@ -1031,6 +1031,15 @@ class VLMAgent(AgentBase):
             return self._fail_result(error="missing required parameter: npc_name")
 
         npc_asset_name = self._npc_name_to_asset_name.get(npc_name)
+        move_to_npc = getattr(self.tongsim, "move_to_npc", None)
+        if npc_asset_name and callable(move_to_npc):
+            logger.info(
+                "move_to_npc got npc_name {} mapped to legacy asset_name {}",
+                npc_name,
+                npc_asset_name,
+            )
+            return move_to_npc(self.character_id, npc_asset_name)
+
         npc_object_id = self.tongsim.get_object_id_by_name(npc_asset_name) if npc_asset_name else None
         logger.info(
             "move_to_npc got npc_name {} mapped to asset_name {} and object_id {}",
