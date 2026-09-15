@@ -1,0 +1,14 @@
+[preliminary_baseline_agent]
+name = "preliminary_baseline_agent"
+sleep_between_steps = 2.0
+log_dir = "logs"
+tongsim_server_endpoint = "127.0.0.1:50060"
+
+[final_baseline_agent]
+name = "final_baseline_agent"
+sleep_between_steps = 2.0
+log_dir = "logs"
+tongsim_server_endpoint = "127.0.0.1:50060"
+
+[grpc]
+endpoint = "127.0.0.1:50051"

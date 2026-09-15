@@ -1,0 +1,4 @@
+在此之前，你已经执行了以下动作：
+[
+  {self.history_actions}
+]

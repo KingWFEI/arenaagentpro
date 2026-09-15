@@ -1,0 +1,133 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools >= 61.0.0"]
+
+[project]
+dynamic = ['version']
+name = "arenaagentpro"
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+  "importlib-metadata",
+  "loguru",
+  "requests",
+  "tqdm==4.66.2",
+  "grpcio>=1.71.0",
+  "grpcio-tools>=1.71.0",
+  "apscheduler==3.10.4",
+  "openai",
+  "python-dotenv>=1.0",
+  "opencv-python",
+  "Pillow",
+  "timm",
+  "pycpd",
+  "matplotlib",
+  "ollama==0.4.2",
+  "transformers==4.47.0",
+  "pandas",
+  "seaborn",
+  "plotly",
+  "scikit-learn",
+  "Pillow",
+  "openpyxl",
+  "toml>=0.10.2",
+  "urllib3==2.6.0",
+  "tiktoken==0.8.0",
+  "redis",
+  "volcengine-python-sdk[ark]",
+  "openai-agents[litellm]"
+]
+
+[project.scripts]
+arenaagent = "arenaagent.builder:main"
+
+[project.optional-dependencies]
+dev = ["ruff", "flake8", "pylint", "Flake8-pyproject", "pre-commit", "black"]
+
+[[tool.uv.index]]
+name = "tuna"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[tool.setuptools]
+include-package-data = false
+py-modules = []
+
+[tool.setuptools.package-data]
+"arenaagent.preliminary_baseline_agent" = ["prompts/*.json", "tasks/*/prompt.txt"]
+"arenaagent.vlm_agent" = ["prompts/*.txt", "prompts/*.json", "skills/*.txt"]
+
+[tool.setuptools.packages.find]
+where = [".", "arenaagent/generated"]
+include = ["arenaagent*", "arena*", "launcher*"]
+exclude = ["arenaagent.generated.arena", "arenaagent.generated.arena.*"]
+
+[tool.ruff]
+extend-exclude = ["*_pb2.py", "*_grpc.py"]
+line-length = 120
+
+[tool.ruff.lint]
+ignore = ["PLR0913"]
+select = ["E", "F", "PL", "B", "N", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"arena/tasks/cognition/utils/*.py" = [
+  "N802",
+  "E722",
+  "PLR2004",
+  "PLR0911",
+  "PLR0912",
+]
+
+[tool.pylint]
+disable = [
+  "C0114",
+  "C0115",
+  "C0116",
+  "R0902",
+  "R0903",
+  "R0904",
+  "R0913",
+  "R0914",
+  "W0511",
+  "R0801",
+  "W0718",
+  "C0302",
+  "R1705",
+  "R0917",
+  "C0301"
+]
+max-line-length = 120
+max-public-methods = 25
+# ignored-modules = "omni,omni.isaac,omni.kit,pxr,torch,PIL,carb,cv2,google.protobuf"
+good-names = ['i', 'j', 'k', 'ex', 'Run', '_', 'dt']
+variable-rgx = "[a-z_][a-z0-9_]*$"
+ignored-modules = ["google", "arena.protocol"]
+
+[tool.pylint.MASTER]
+ignore-patterns = ".*_pb2.py,.*_grpc.py"
+
+[tool.black]
+line-length = 120
+exclude = '''
+(
+    .*_pb2.py
+    | .*_grpc.py
+
+    | build
+)
+'''
+
+[tool.isort]
+profile = "black"
+py_version = 311
+
+[tool.flake8]
+max-line-length = 120
+per-file-ignores = [
+  "__init__.py:F401",
+  "arena/tasks/cognition/utils/*.py:N802,E722",
+]
+exclude = ["build", "*_pb2.py", "*_grpc.py"]

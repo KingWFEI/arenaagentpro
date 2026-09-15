@@ -1,0 +1,139 @@
+--- Subject 1
+对于一个任务"请拿1个香蕉到餐桌BP_DiningTable_06上"，一个合适的决策序列为：
+
+--- Obs Step 1
+当前的任务是"请拿1个香蕉到餐桌BP_DiningTable_06上"，当前的视野中的物体信息如下：
+
+[
+
+  [{'desired_name': 'BP_Plant_04_C_0', 'color': string: "Green"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -58.389102935791016, 'Y': -151.97366333007812, 'Z': 3.7463934421539307}, 'object': 'BP_Plant_04_C_0'}, {'desired_name': 'BP_Decor_Plant_5_C_0', 'color': string: "Green"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -74.44951629638672, 'Y': 45.25641632080078, 'Z': 83.76791381835938}, 'object': 'BP_Decor_Plant_5_C_0'}, {'desired_name': 'BP_Carpet_Rectangle_C_0', 'color': string: "Gray"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -227.02130126953125, 'Y': -333.81719970703125, 'Z': 3.751254081726074}, 'object': 'BP_Carpet_Rectangle_C_0'}, {'desired_name': 'BP_DVD_Player_C_1', 'color': string: "White"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -147.65676879882812, 'Y': 31.091938018798828, 'Z': 48.23710632324219}, 'object': 'BP_DVD_Player_C_1'}, {'desired_name': 'BP_Fruit_Banana_C_0_0EFC92D64E3844A2155A62A705AC764D', 'color': string: "Yellow"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -230.42897033691406, 'Y': -343.43682861328125, 'Z': 39.805641174316406}, 'object': 'BP_Fruit_Banana_C_0_0EFC92D64E3844A2155A62A705AC764D'}, {'desired_name': 'BP_RemoteController_01_C_0', 'color': string: "Black"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -246.8582305908203, 'Y': -409.09796142578125, 'Z': 37.109352111816406}, 'object': 'BP_RemoteController_01_C_0'}, {'desired_name': 'BP_Wall_BaseCeter_C_4_24C988854EFA3A11561EBBB542BCD859', 'color': string: "White"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -2.235931634902954, 'Y': -58.273014068603516, 'Z': 137.4453887939453}, 'object': 'BP_Wall_BaseCeter_C_4_24C988854EFA3A11561EBBB542BCD859'}, {'desired_name': 'BP_Ceiling_15_1_FB_C_0', 'color': string: "White"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -300.9508361816406, 'Y': -159.00567626953125, 'Z': 256.7012634277344}, 'object': 'BP_Ceiling_15_1_FB_C_0'}, {'desired_name': 'BP_Wall_BaseCeter_C_10', 'color': string: "White"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -137.33412170410156, 'Y': -532.875244140625, 'Z': 15.696696281433105}, 'object': 'BP_Wall_BaseCeter_C_10'}, {'desired_name': 'BP_Wall_BaseCeter_C_6_93A39833496E7BA024BE4493F0B686B0', 'color': string: "White"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -143.5255584716797, 'Y': 352.7142639160156, 'Z': 143.76718139648438}, 'object': 'BP_Wall_BaseCeter_C_6_93A39833496E7BA024BE4493F0B686B0'}, {'desired_name': 'BP_Curtains_Bedroom_C_1', 'color': string: "Black"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -287.6615905761719, 'Y': 329.6964111328125, 'Z': 283.7777099609375}, 'object': 'BP_Curtains_Bedroom_C_1'}, {'desired_name': 'BP_Window_1st_7_C_0', 'color': string: "White"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -201.6763916015625, 'Y': -526.1119995117188, 'Z': 33.04673385620117}, 'object': 'BP_Window_1st_7_C_0'}, {'desired_name': 'BP_Carpet_01_C_0', 'color': string: "Yellow"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -366.41400146484375, 'Y': 73.6439208984375, 'Z': 3.7512600421905518}, 'object': 'BP_Carpet_01_C_0'}, {'desired_name': 'BP_Plate_02_C_0', 'color': string: "Yellow"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -231.67356872558594, 'Y': -343.7178039550781, 'Z': 37.16078186035156}, 'object': 'BP_Plate_02_C_0'}, {'desired_name': 'BP_Wall_BaseCeter_C_8', 'color': string: "White"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -122.65583038330078, 'Y': -532.875244140625, 'Z': 248.2408905029297}, 'object': 'BP_Wall_BaseCeter_C_8'}, {'desired_name': 'BP_ShoesBox_1_C_1', 'color': string: "Yellow"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -91.13851928710938, 'Y': 79.71784973144531, 'Z': 3.844620943069458}, 'object': 'BP_ShoesBox_1_C_1'}, {'desired_name': 'BP_Dirt_Milk_C_0', 'color': string: "White"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -38.6646842956543, 'Y': -230.15103149414062, 'Z': 77.5118408203125}, 'object': 'BP_Dirt_Milk_C_0'}, {'desired_name': 'ChildActor_GEN_VARIABLE_BP_Plug_Back_C_CAT_0', 'color': string: "Black"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -17.73714256286621, 'Y': -398.7319641113281, 'Z': 6.342153072357178}, 'object': 'ChildActor_GEN_VARIABLE_BP_Plug_Back_C_CAT_0'}, {'desired_name': 'BP_DiningTable_06_C_0', 'color': string: "Yellow"
+, 'shape': string: "Cuboid"
+, 'place_location': {'X': -348.715576171875, 'Y': 97.6534194946289, 'Z': 3.751265048980713}, 'object': 'BP_DiningTable_06_C_0'}, {'desired_name': 'BP_Plant_010_C_0', 'color': string: "White"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -58.757118225097656, 'Y': -456.4314270019531, 'Z': 2.6193602085113525}, 'object': 'BP_Plant_010_C_0'}, {'desired_name': 'BP_Wall_BaseCeter_C_5_C7BACAD343185118A0EA919DFBE94D83', 'color': string: "White"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -28.018550872802734, 'Y': -532.875244140625, 'Z': 143.7671661376953}, 'object': 'BP_Wall_BaseCeter_C_5_C7BACAD343185118A0EA919DFBE94D83'}, {'desired_name': 'BP_Wall_BaseCeter_C_0_F86E6AEA44B739FD74B655A6CB3C167E', 'color': string: "White"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -2.668881893157959, 'Y': 231.56875610351562, 'Z': 247.1318817138672}, 'object': 'BP_Wall_BaseCeter_C_0_F86E6AEA44B739FD74B655A6CB3C167E'}, {'desired_name': 'BP_Wall_BaseCeter_C_11', 'color': string: "White"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -2.5426976680755615, 'Y': -318.7669372558594, 'Z': 137.4453887939453}, 'object': 'BP_Wall_BaseCeter_C_11'}, {'desired_name': 'BP_Vase_04_C_0', 'color': string: "Brown"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -31.753246307373047, 'Y': 31.11634635925293, 'Z': 48.070068359375}, 'object': 'BP_Vase_04_C_0'}, {'desired_name': 'BP_Floor_15_3_C_0', 'color': string: "White"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -312.3979797363281, 'Y': -97.72423553466797, 'Z': -1.4987430572509766}, 'object': 'BP_Floor_15_3_C_0'}, {'desired_name': 'BP_Wall_BaseCeter_C_2_292CE81F4156E7764E7798BA43428613', 'color': string: "White"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -343.6598205566406, 'Y': -532.875244140625, 'Z': 143.76718139648438}, 'object': 'BP_Wall_BaseCeter_C_2_292CE81F4156E7764E7798BA43428613'}, {'desired_name': 'BP_TV_01_C_0', 'color': string: "Black"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -34.97279739379883, 'Y': -335.4285888671875, 'Z': 90.36299133300781}, 'object': 'BP_TV_01_C_0'}, {'desired_name': 'BP_CoffeeTable_Table_Coffee_C_0', 'color': string: "Yellow"
+, 'shape': string: "Cuboid"
+, 'place_location': {'X': -223.8824462890625, 'Y': -384.6573181152344, 'Z': 5.351233005523682}, 'object': 'BP_CoffeeTable_Table_Coffee_C_0'}, {'desired_name': 'BP_Vase_1_C_1', 'color': string: "Yellow"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -69.22845458984375, 'Y': 32.918121337890625, 'Z': 48.317535400390625}, 'object': 'BP_Vase_1_C_1'}, {'desired_name': 'BP_ShoesBox_1_C_0', 'color': string: "Yellow"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -90.76848602294922, 'Y': 38.92989730834961, 'Z': 3.8446218967437744}, 'object': 'BP_ShoesBox_1_C_0'}, {'desired_name': 'BP_Wall_BaseCeter_C_12', 'color': string: "White"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -1.9256443977355957, 'Y': 259.1075439453125, 'Z': 137.4453887939453}, 'object': 'BP_Wall_BaseCeter_C_12'}, {'desired_name': 'BP_Wall_BaseCeter_C_7', 'color': string: "White"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -2.2103450298309326, 'Y': 96.01731872558594, 'Z': 137.4453887939453}, 'object': 'BP_Wall_BaseCeter_C_7'}, {'desired_name': 'BP_Window_Glass_C_2', 'color': string: "Unknown"
+, 'shape': string: "Unknown"
+, 'place_location': {'X': -191.8771514892578, 'Y': -534.556640625, 'Z': 44.71247100830078}, 'object': 'BP_Window_Glass_C_2'}]
+
+]
+
+当前手上没有物品。
+
+--- Instruction Step 1
+[
+  {
+    "think": "我观察视野中有香蕉BP_Fruit_Banana_C_0_0EFC92D64E3844A2155A62A705AC764D，我将把它拿起来。",
+    "action": "move_and_take_object",
+    "parameters": {
+      "Object": "BP_Fruit_Banana_C_0_0EFC92D64E3844A2155A62A705AC764D",
+      "which_hand": 0
+    },
+    "output": 0
+  }
+]
+
+--- Obs Step 2
+当前的任务是"请拿1个香蕉到餐桌BP_DiningTable_06上"，当前手上物品为"BP_Fruit_Banana_C_0_0EFC92D64E3844A2155A62A705AC764D"。
+
+--- Instruction Step 2
+[
+  {
+    "think": "我要把香蕉放到餐桌BP_DiningTable_06上，首先我要找到走到餐桌BP_DiningTable_06旁边，当前场景中的餐桌是BP_DiningTable_06_C_0",
+    "action": "move_to_object",
+    "parameters": {
+      "object": "BP_DiningTable_06_C_0"
+    },
+    "output": 0
+  }
+]
+
+--- Obs Step 3
+当前的任务是"请拿1个香蕉到餐桌BP_DiningTable_06上"，当前手上物品为"BP_Fruit_Banana_C_0_0EFC92D64E3844A2155A62A705AC764D"。
+
+
+--- Instruction Step 3
+[
+  {
+    "think": "我走到了餐桌旁，现在我要把手上的香蕉放到餐桌上，餐桌的位置是{'X': -348.715576171875, 'Y': 97.6534194946289, 'Z': 3.751265048980713}",
+    "action": "put_down_sth_to_location",
+    "parameters": {
+      "location": {"X": -348.715576171875, "Y": 97.6534194946289, "Z": 3.751265048980713}
+    },
+    "output": 0
+  }
+]
+
+--- Obs Step 4
+
+当前手上没有物品，输出任务结果，任务结束。
+
+--- Instruction Step 4
+[
+  {
+    "think": "我已经把香蕉放到餐桌上了，任务完成。",
+    "action": "finish_task",
+    "output": 0
+  }
+]
+
+
+--- Subject 2

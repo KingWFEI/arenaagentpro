@@ -1,0 +1,243 @@
+示例：
+
+对于一个任务" 你有3分钟时间，请进行整理餐桌以供3个人用餐。"，一个合适的决策序列为：
+
+--- Obs Step 1
+当前的任务是"你有3分钟时间，请进行整理餐桌以供3个人用餐。"，当前的视野中的物体信息如下：
+
+[
+
+  [{'color': string: "Green" , 'shape': string: "Unknown" , 'place_location': {'X': -58.389102935791016, 'Y': -151.97366333007812, 'Z': 3.7463934421539307}, 'object_id': '1'} ]
+
+]
+当前手上无物品
+
+
+--- Instruction Step 1
+[
+  {
+    "think": "收拾桌子首先需要走到桌子旁边，面对桌子，当前场景中的桌子ID为1，需要走到它旁边",
+    "action": "move_to_object",
+    "parameters": {
+      "object_id": "1"
+    },
+    "output": 0
+  }
+]
+
+--- Obs Step 2
+当前的任务是"你有3分钟时间，请进行整理餐桌以供3个人用餐。"，当前的视野中的物体信息如下：
+
+[
+
+  [{'color': string: "Green" , 'shape': string: "Unknown" , 'place_location': {'X': -58.389102935791016, 'Y': -151.97366333007812, 'Z': 3.7463934421539307}, 'object_id': '2'},
+    {'color': string: "Yellow" , 'shape': string: "Cuboid" , 'place_location': {'X': -348.715576171875, 'Y': 97.6534194946289, 'Z': 3.751265048980713}, 'object_id': '1'},
+   ]
+
+]
+当前手上无物品
+
+--- Instruction Step 2
+[
+  {
+    "think": "虽然我看到了桌子，但是并没有看到全部桌子上的东西，我要转身看看桌子上有什么东西。",
+    "action": "turn_around_to_degree",
+    "parameters": {
+      "degree": -90
+    },
+    "output": 0
+  }
+]
+
+--- Obs Step 3
+当前的任务是"你有3分钟时间，请进行整理餐桌以供3个人用餐。"，当前的视野中的物体信息如下：
+
+[
+
+  [
+    {'color': string: "Green" , 'shape': string: "Unknown" , 'place_location': {'X': -58.389102935791016, 'Y': -151.97366333007812, 'Z': 3.7463934421539307}, 'object_id': '2'},
+    {'color': string: "Yellow" , 'shape': string: "Cuboid" , 'place_location': {'X': -348.715576171875, 'Y': 97.6534194946289, 'Z': 3.751265048980713}, 'object_id': '1'},
+    {'color': string: "White" , 'shape': string: "Unknown" , 'place_location': {'X': -311.71563720703125, 'Y': 12.653483390808105, 'Z': 41.42823791503906}, 'object_id': '3'},
+    {'color': string: "Pink" , 'shape': string: "Unknown" , 'place_location': {'X': -354.7159423828125, 'Y': 70.6534423828125, 'Z': 41.25614547729492}, 'object_id': '4'},
+    {'color': string: "Pink" , 'shape': string: "Unknown" , 'place_location': {'X': -385.71405029296875, 'Y': 111.69300842285156, 'Z': 41.256099700927734}, 'object_id': '5'}
+  ]
+
+]
+当前手上无物品
+
+--- Instruction Step 3
+[
+  {
+    "think": "我看到桌子了，而且还看到桌子上有三个茶杯，但是它们排列很不整齐，我可以把它们摆放得整齐一点，这样更适合3个人用餐。",
+    "action": "move_and_take_object",
+    "parameters": {
+      "object_id": "3",
+      "which_hand": 0
+    },
+    "output": 0
+  }
+]
+
+--- Obs Step 4
+当前的任务是"你有3分钟时间，请进行整理餐桌以供3个人用餐。"，当前的视野中的物体信息如下：
+
+[
+
+  [
+    {'color': string: "Green" , 'shape': string: "Unknown" , 'place_location': {'X': -58.389102935791016, 'Y': -151.97366333007812, 'Z': 3.7463934421539307}, 'object_id': '2'},
+    {'color': string: "Yellow" , 'shape': string: "Cuboid" , 'place_location': {'X': -348.715576171875, 'Y': 97.6534194946289, 'Z': 3.751265048980713}, 'object_id': '1'},
+    {'color': string: "Pink" , 'shape': string: "Unknown" , 'place_location': {'X': -354.7159423828125, 'Y': 70.6534423828125, 'Z': 41.25614547729492}, 'object_id': '4'},
+    {'color': string: "Pink" , 'shape': string: "Unknown" , 'place_location': {'X': -385.71405029296875, 'Y': 111.69300842285156, 'Z': 41.256099700927734}, 'object_id': '5'}
+  ]
+
+]
+当前手上物品为：3
+
+--- Instruction Step 3
+[
+  {
+    "think": "我拿到了一个杯子，我要先把它放在桌子中间。",
+    "action": "put_down_sth_to_location",
+    "parameters": {
+      "location": {'X': -348.715576171875, 'Y': 97.6534194946289, 'Z': 63.751265048980713}
+    },
+    "output": 0
+  }
+]
+
+--- Obs Step 4
+当前的任务是"你有3分钟时间，请进行整理餐桌以供3个人用餐。"，当前的视野中的物体信息如下：
+
+[
+
+  [
+    {'color': string: "Green" , 'shape': string: "Unknown" , 'place_location': {'X': -58.389102935791016, 'Y': -151.97366333007812, 'Z': 3.7463934421539307}, 'object_id': '2'},
+    {'color': string: "Yellow" , 'shape': string: "Cuboid" , 'place_location': {'X': -348.715576171875, 'Y': 97.6534194946289, 'Z': 3.751265048980713}, 'object_id': '1'},
+    {'color': string: "Pink" , 'shape': string: "Unknown" , 'place_location': {'X': -354.7159423828125, 'Y': 70.6534423828125, 'Z': 41.25614547729492}, 'object_id': '4'},
+    {'color': string: "Pink" , 'shape': string: "Unknown" , 'place_location': {'X': -385.71405029296875, 'Y': 111.69300842285156, 'Z': 41.256099700927734}, 'object_id': '5'}
+    {'color': string: "White" , 'shape': string: "Unknown" , 'place_location': {'X': -348.715576171875, 'Y': 97.6534194946289, 'Z': 41.42823791503906}, 'object_id': '3'},
+  ]
+
+]
+当前手上无物品
+
+--- Instruction Step 4
+[
+  {
+    "think": "第一个杯子放好了，我现在要把第二个杯子放在桌子的右边。",
+    "action": "move_and_take_object",
+    "parameters": {
+      "object_id": "4",
+      "which_hand": 0
+    },
+    "output": 0
+  }
+]
+
+--- Obs Step 5
+当前的任务是"你有3分钟时间，请进行整理餐桌以供3个人用餐。"，当前的视野中的物体信息如下：
+
+[
+
+  [
+    {'color': string: "Green" , 'shape': string: "Unknown" , 'place_location': {'X': -58.389102935791016, 'Y': -151.97366333007812, 'Z': 3.7463934421539307}, 'object_id': '2'},
+    {'color': string: "Yellow" , 'shape': string: "Cuboid" , 'place_location': {'X': -348.715576171875, 'Y': 97.6534194946289, 'Z': 3.751265048980713}, 'object_id': '1'},
+    {'color': string: "Pink" , 'shape': string: "Unknown" , 'place_location': {'X': -385.71405029296875, 'Y': 111.69300842285156, 'Z': 41.256099700927734}, 'object_id': '5'}
+    {'color': string: "White" , 'shape': string: "Unknown" , 'place_location': {'X': -348.715576171875, 'Y': 97.6534194946289, 'Z': 41.42823791503906}, 'object_id': '3'},
+  ]
+
+]
+当前手上物品为：4
+
+--- Instruction Step 5
+[
+  {
+    "think": "我拿到了第二个杯子，我要把它放在桌子的右边。",
+    "action": "put_down_sth_to_location",
+    "parameters": {
+      "location": {'X': -343, 'Y': 97, 'Z': 63.751265048980713}
+    },
+    "output": 0
+  }
+]
+
+--- Obs Step 6
+当前的任务是"你有3分钟时间，请进行整理餐桌以供3个人用餐。"，当前的视野中的物体信息如下：
+
+[
+
+  [
+    {'color': string: "Green" , 'shape': string: "Unknown" , 'place_location': {'X': -58.389102935791016, 'Y': -151.97366333007812, 'Z': 3.7463934421539307}, 'object_id': '2'},
+    {'color': string: "Yellow" , 'shape': string: "Cuboid" , 'place_location': {'X': -348.715576171875, 'Y': 97.6534194946289, 'Z': 3.751265048980713}, 'object_id': '1'},
+    {'color': string: "Pink" , 'shape': string: "Unknown" , 'place_location': {'X': -385.71405029296875, 'Y': 111.69300842285156, 'Z': 41.256099700927734}, 'object_id': '5'}
+    {'color': string: "White" , 'shape': string: "Unknown" , 'place_location': {'X': -348.715576171875, 'Y': 97.6534194946289, 'Z': 41.42823791503906}, 'object_id': '4'},
+    {'color': string: "Pink" , 'shape': string: "Unknown" , 'place_location': {'X': -343, 'Y': 97, 'Z': 41.42823791503906}, 'object_id': '3'},
+  ]
+
+]
+当前手上无物品
+
+--- Instruction Step 6
+[
+  {
+    "think": "第二个杯子放好了，我现在要把第三个杯子放在桌子的左边。",
+    "action": "move_and_take_object",
+    "parameters": {
+      "Object": "5",
+      "which_hand": 0
+    },
+    "output": 0
+  }
+]
+
+--- Obs Step 6
+当前的任务是"你有3分钟时间，请进行整理餐桌以供3个人用餐。"，当前的视野中的物体信息如下：
+
+[
+
+  [
+    {'color': string: "Green" , 'shape': string: "Unknown" , 'place_location': {'X': -58.389102935791016, 'Y': -151.97366333007812, 'Z': 3.7463934421539307}, 'object_id': '2'},
+    {'color': string: "Yellow" , 'shape': string: "Cuboid" , 'place_location': {'X': -348.715576171875, 'Y': 97.6534194946289, 'Z': 3.751265048980713}, 'object_id': '1'},
+    {'color': string: "White" , 'shape': string: "Unknown" , 'place_location': {'X': -348.715576171875, 'Y': 97.6534194946289, 'Z': 41.42823791503906}, 'object_id': '4'},
+    {'color': string: "Pink" , 'shape': string: "Unknown" , 'place_location': {'X': -343, 'Y': 97, 'Z': 41.42823791503906}, 'object_id': '3'},
+  ]
+
+]
+当前手上物品为：5
+
+--- Instruction Step 7
+[
+  {
+    "think": "第二个杯子放好了，我现在要把第三个杯子放在桌子的左边。",
+    "action": "put_down_sth_to_location",
+    "parameters": {
+      "location": {'X': -353, 'Y': 97, 'Z': 63.751265048980713}
+    },
+    "output": 0
+  }
+]
+
+--- Obs Step 7
+当前的任务是"你有3分钟时间，请进行整理餐桌以供3个人用餐。"，当前的视野中的物体信息如下：
+
+[
+
+  [
+    {'color': string: "Green" , 'shape': string: "Unknown" , 'place_location': {'X': -58.389102935791016, 'Y': -151.97366333007812, 'Z': 3.7463934421539307}, 'object_id': '2'},
+    {'color': string: "Yellow" , 'shape': string: "Cuboid" , 'place_location': {'X': -348.715576171875, 'Y': 97.6534194946289, 'Z': 3.751265048980713}, 'object_id': '1'},
+    {'color': string: "White" , 'shape': string: "Unknown" , 'place_location': {'X': -348.715576171875, 'Y': 97.6534194946289, 'Z': 41.42823791503906}, 'object_id': '3'},
+    {'color': string: "Pink" , 'shape': string: "Unknown" , 'place_location': {'X': -343, 'Y': 97, 'Z': 41.42823791503906}, 'object_id': '4'},
+    {'color': string: "Pink" , 'shape': string: "Unknown" , 'place_location': {'X': -353, 'Y': 97, 'Z': 41.42823791503906}, 'object_id': '5'}
+  ]
+
+]
+当前手上无物品
+
+--- Instruction Step 7
+[
+  {
+    "think": "我看到所有茶杯都摆放好了，我认为我已经完成了整理餐桌的任务。",
+    "action": "finish_task",
+    "output": 0
+  }
+]

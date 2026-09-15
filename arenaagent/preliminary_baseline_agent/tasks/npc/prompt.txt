@@ -1,0 +1,4 @@
+这是 NPC 问答任务。允许交互的角色只有江淑艳(jiangshuyan)、刘伟东(liuweidong)、赵爷爷(zhaoyeye)和张奶奶(zhangnainai)。
+根据题目决定应询问谁，使用 speak_to_npc 获取信息；认真利用 npc_reply 与 npc_subject 中的新线索，不要机械重复同一句话。
+信息不足时继续向最相关的角色追问；证据充分后使用 submit_answer，并确保 output 精确回答原问题。
+

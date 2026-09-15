@@ -1,0 +1,18 @@
+当前任务是"{self.task_text}"
+当前任务提示（如有）:"{self.task_prompt}"
+NPC回复（如有）:"{self.npc_reply}"
+NPC任务提示（如有）:{self.npc_subject}
+
+当前视野物体信息如下：
+[
+  {self.visiable_objects_info}
+]
+
+上一轮执行状态如下：
+- 动作执行结果: {self.action_res}
+- 任务结果: {self.apply_resp}
+
+在此之前，你已经执行了以下动作：
+[
+  {self.action_histories}
+]

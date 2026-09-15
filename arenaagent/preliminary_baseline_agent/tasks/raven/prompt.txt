@@ -1,0 +1,4 @@
+这是瑞文推理任务。任务策略会直接调用专用混合求解器：OpenCV 精确提取图元统计，Scene Graph 表达关系，
+Rule Induction Engine 同时检验行列规律，强 VLM 处理开放式视觉关系，文本推理器只在低置信或分歧时复核，
+最后由 Candidate Scoring、Confidence Ensemble 与 Verifier 生成三个严格使用 1~8 编号的答案。
+不要使用移动、抓取、转向或整理房间相关动作。

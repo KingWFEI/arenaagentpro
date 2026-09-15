@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+import "google/protobuf/struct.proto";
+
+package tongsim.service;
+
+service TongSimService {
+  // Character lifecycle
+  rpc spawn_character(google.protobuf.Struct)   returns (google.protobuf.Struct) {}
+  rpc destory_character(google.protobuf.Struct) returns (google.protobuf.Struct) {}
+  rpc close(google.protobuf.Struct)             returns (google.protobuf.Struct) {}
+  rpc heartbeat(google.protobuf.Struct)         returns (google.protobuf.Struct) {}
+
+  // Perception
+  rpc acquire_first_person_image(google.protobuf.Struct)           returns (google.protobuf.Struct) {}
+  rpc acquire_first_person_segmantic_image(google.protobuf.Struct) returns (google.protobuf.Struct) {}
+  rpc fetch_first_person_visible_objects(google.protobuf.Struct)   returns (google.protobuf.Struct) {}
+  rpc get_object_basic_info(google.protobuf.Struct)                returns (google.protobuf.Struct) {}
+  rpc get_object_id_by_name(google.protobuf.Struct)                returns (google.protobuf.Struct) {}
+  rpc get_object_in_hand(google.protobuf.Struct)                   returns (google.protobuf.Struct) {}
+  rpc set_object_pose(google.protobuf.Struct)                      returns (google.protobuf.Struct) {}
+  rpc get_object_world_aabb(google.protobuf.Struct)               returns (google.protobuf.Struct) {}
+
+  // View control
+  rpc look_at_location(google.protobuf.Struct)  returns (google.protobuf.Struct) {}
+  rpc look_at_object(google.protobuf.Struct)    returns (google.protobuf.Struct) {}
+  rpc point_at_object(google.protobuf.Struct)   returns (google.protobuf.Struct) {}
+
+  // Movement
+  rpc move_to_location(google.protobuf.Struct)   returns (google.protobuf.Struct) {}
+  rpc move_forward(google.protobuf.Struct)        returns (google.protobuf.Struct) {}
+  rpc move_to_object(google.protobuf.Struct)      returns (google.protobuf.Struct) {}
+  rpc move_and_take_object(google.protobuf.Struct) returns (google.protobuf.Struct) {}
+  rpc turn_in_degree(google.protobuf.Struct)      returns (google.protobuf.Struct) {}
+
+  // Object manipulation
+  rpc put_down_to_location(google.protobuf.Struct)                  returns (google.protobuf.Struct) {}
+  rpc pour_water(google.protobuf.Struct)                            returns (google.protobuf.Struct) {}
+  rpc slice_food(google.protobuf.Struct)                            returns (google.protobuf.Struct) {}
+  rpc wash_hands(google.protobuf.Struct)                            returns (google.protobuf.Struct) {}
+  rpc wash_object_in_hand(google.protobuf.Struct)                   returns (google.protobuf.Struct) {}
+  rpc move_and_put_down_object_in_container(google.protobuf.Struct) returns (google.protobuf.Struct) {}
+  rpc move_and_put_down(google.protobuf.Struct)                      returns (google.protobuf.Struct) {}
+
+  // Interaction
+  rpc open_door(google.protobuf.Struct)          returns (google.protobuf.Struct) {}
+  rpc close_door(google.protobuf.Struct)         returns (google.protobuf.Struct) {}
+  rpc sit_down_to_object(google.protobuf.Struct) returns (google.protobuf.Struct) {}
+  rpc mop_floor(google.protobuf.Struct)          returns (google.protobuf.Struct) {}
+  rpc rest(google.protobuf.Struct)               returns (google.protobuf.Struct) {}
+  rpc speak_to_npc(google.protobuf.Struct)       returns (google.protobuf.Struct) {}
+  rpc interact(google.protobuf.Struct)           returns (google.protobuf.Struct) {}
+}

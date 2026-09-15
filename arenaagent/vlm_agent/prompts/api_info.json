@@ -1,0 +1,50 @@
+{
+    "move_and_take_object": {
+        "sig": "(object_id: str, which_hand=0)", 
+        "docs": "移动到对象的位置并抓取对象。\n\n:param object_id: 目标对象\n:param which_hand: 使用的手 (int)"
+    },
+    "move_forward": {
+        "sig": "(distance: float)",
+        "docs": "向前移动指定距离，单位是厘米。\n\n:param distance: 前进距离(厘米)"
+    },
+    "move_backward": {
+        "sig": "(distance: float)",
+        "docs": "向后退指定距离，单位是厘米。\n\n:param distance: 前进距离（厘米）"
+    },
+    "move_and_put_down": {
+        "sig": "(which_hand=0, move_target_location:Vector3, put_target_location:Vector3, put_rotation: Quaternion|None)",
+        "docs": "移动到指定位置，并将手中的物体放在需要放置的位置，当无法到达放置位置时，会保持抓握状态。如果无法放置可以尝试走近一些。\n\n:param move_target_location: 移动的指定位置\n:param put_target_location: 物品放置的指定位置\n:param put_rotation: 物品放置的旋转位置\n"
+    },
+    "move_and_put_down_object_in_container": {
+        "sig": "(which_hand=0)",
+        "docs": "移动并将手中物体放入场景容器。垃圾桶等有侧壁的容器应优先使用此动作，不要自行猜测桶内放置坐标。\n\n:param which_hand: 使用的手 (int)"
+    },
+    "turn_in_degree": {
+        "sig": "(degree)", 
+        "docs": "使角色朝向指定的角度。\n\n:param degree: 目标角度"
+    }, 
+    "move_to_object": {
+        "sig": "(object_id: str)", 
+        "docs": "移动至指定目标。\n\n:param object_id: 目标实体的 ID"
+    },
+    "move_to_npc": {
+        "sig": "(npc_name: str)",
+        "docs": "Move to a named NPC.\n\n:param npc_name: npc1/npc2/npc3"
+    },
+    "move_to_location": {
+        "sig": "(target_location:Vector3, stop_distance:float=0.5)", 
+        "docs": "移动到指定位置。\n\n:param target_location: 目标位置\n:param stop_distance: 停止距离，默认0.5米"
+    },
+    "speak_to_npc": {
+        "sig": "(npc_name:str, message:str)",
+        "docs": "与指定NPC说话。\n\n:param npc_name: npc1/npc2/npc3\n:param message: 对话内容\n"
+    },
+    "submit_answer": {
+        "sig": "(output:any)",
+        "docs": "向任务系统提交最终答案。实际提交内容会由agent自动拼接为 think + output，并写入 action_space 对应 key。\n\n:param output: 要提交给任务的答案（字符串、数字等）"
+    },
+    "solve_raven": {
+        "sig": "()",
+        "docs": "解决瑞文测试题目。该方法会自动获取当前瑞文测试的题目，并返回答案。"
+    }
+}

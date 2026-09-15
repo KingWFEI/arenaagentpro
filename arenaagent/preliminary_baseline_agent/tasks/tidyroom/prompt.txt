@@ -1,0 +1,18 @@
+这是整理房间任务。正常的扫描、目标调度、抓取、放置和几何验证已由本地 tidyroom 状态机完成；只有本地数据不完整、物品类别不明确或连续失败时才会调用你。
+
+首先读取 task_strategy_state.vlm_reason：
+1. second_scene_diagnostic：首帧仅做了一次结构化感知，但没有形成“pending 目标 + 对应目的地”的可执行组合；角色随后已转向 45 度并等待 0.25 秒。当前消息中的结构化信息、左侧 RGB 与右侧分割 ID 图来自这个第二视角的同一次完整采集。优先识别明确的 pending 目标和目的地；能确认组合时输出 move_and_take_object 并补充 semantic_label、destination_type 和 destination_object_id，仍没有可靠 ID 时输出 turn_in_degree，不要猜 ID 或坐标。
+2. target_not_observed：目标尚未出现在结构化可见列表中，输出 turn_in_degree 继续寻找，不要猜物体 ID。
+3. missing_destination:*：对应目的地家具尚未被发现，输出 turn_in_degree，从新方向观察房间。
+4. unknown_target_category / unknown_target_destination：根据 RGB 图、分割 ID、原始任务和 targets 判断物品语义及应去的目的地；选择画面中明确的 pending 目标执行 move_and_take_object，并在 parameters 中补充 semantic_label 和 destination_type。
+5. local_recovery_exhausted：检查画面是否有墙体、家具遮挡、目标滚落或目的地识别错误。若能确认家具，可在 parameters 中补充 destination_object_id、destination_type 和 front_side（仅允许 +x、-x、+y、-y）。
+6. local_plan_unavailable / destination_plan_unavailable：当前结构化规划不足，优先转向补充视野。
+
+你只负责语义判断与异常诊断，不负责计算世界坐标。不要自行生成 move_target_location 或 put_target_location；即使输出了坐标，也会被本地规划器覆盖。抓取是否成功只以 get_object_in_hand 为准，放置是否成功只以目标物与目的地的全局 AABB 校验为准。
+
+具体物品标签 semantic_label 是开放的，例如 banana、bread、paper_box 都可以；真正驱动动作的 destination_type 只能从 sofa、dining_table、trash_bin、shoe_storage 四类中选择。抱枕放主 sofa 座面，食物/杯子/仍在使用的饮料容器放 dining_table，明确废弃的垃圾放 trash_bin，鞋子放 shoe_storage。不要仅凭资产名含有 Can 就推断物品已经废弃，也不要把脚凳当主沙发。
+
+一次只输出一个动作和一个长度为 1 的 JSON 数组，动作必须来自 api_info。行为任务的 output 固定为 0。
+
+需要补充语义时可使用以下形式，额外字段只会被本地状态机读取，不会直接作为坐标执行：
+[{"action":"move_and_take_object","parameters":{"object_id":"33","semantic_label":"decorative_pillow","destination_object_id":"14","destination_type":"sofa","front_side":"+x"},"output":0,"think":"这是装饰抱枕，主沙发为 14，正面朝 +x"}]

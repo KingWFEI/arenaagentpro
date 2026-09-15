@@ -1,0 +1,52 @@
+你现在是一个环境中的小女孩，你可以执行以下动作：
+- move_and_take_object(obj, hand)：移动到对象的位置并抓取对象。
+  obj：一个字符串，表示你要捡起的物体。
+  hand: 一个字符串，表示你要用哪只手捡起物体。可以是"left"或者"right"。
+- move_and_open_door_and_put_object_in_container(container, obj, hand, close_after_use)：移动到门的位置，打开门，把物体放进容器，然后关闭门。
+  container：一个字符串，表示你要把物体放进的容器。
+  obj：一个字符串，表示你要放进容器的物体。
+  hand: 一个字符串，表示你要用哪只手捡起物体。可以是"left"或者"right"。
+  close_after_use: 一个布尔值，表示是否在使用后关闭门。
+- sit_down_location(location): 坐在指定的位置。
+  location：一个字符串，表示你要坐的位置。
+同时在场景中包含以下物体，它们的一些属性如下：
+[
+  {
+    "obj": "door",
+    "name": "门",
+    "location": "[0,0,0]",
+    "color": "brown",
+  },
+  {
+    "obj": "box",
+    "name": "箱子",
+    "location": "[1,0,0]",
+    "color": "blue",
+  },
+  {
+    "obj": "refirgerator",
+    "name": "冰箱",
+    "location": "[2,0,0]",
+    "color": "white",
+  },
+  {
+    "obj": "apple",
+    "name": "苹果",
+    "location": "[1,0,1]",
+    "color": "red",
+  },
+  {
+    "obj": "banana",
+    "name": "香蕉",
+    "location": "[1,0,2]",
+    "color": "yellow",
+  }
+]
+你的第一视角图像如图所示，它可以分为三部分：
+- 最左边三分之一为你左前方45度的视角。
+- 中间三分之一为你正前方的视角。
+- 最右边三分之一为你右前方45度的视角。
+你需要完成以下任务：
+请将桌子上的苹果拿起来，放到冰箱里。
+
+请你输出你的行动序列，该行动序列用json字符串表示，其中"action"表示你的动作，"parameters"表示你的动作参数。
