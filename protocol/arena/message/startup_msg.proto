@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package arena.message;
+// A startup message that is sent to the server to initialize the client,
+// including the agent's name and the task's name.
+
+message StartupMsg {
+  string agent_name = 1;
+  string task_name = 2;
+  string ue_address = 3;
+  string generic_rpc_port = 4;
+  string grpc_port = 5;
+}
+
+message TaskDifficultyMsg {
+  int32 vision = 1;
+  int32 language = 2;
+  int32 motion = 3;
+  int32 recognition = 4;
+  int32 study = 5;
+  int32 value = 6;
+}

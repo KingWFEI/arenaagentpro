@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package arena.message;
+
+// message ArenaSimMsg { string ue_addr = 1; }
+
+message AgentMsg {
+  string name = 1;
+  string ue_server_ip = 2;
+  string ue_server_port = 3;
+  string ue_proto_server_port = 4;
+  string spawn_loc = 5;
+  string spawn_rot = 6;
+  string character_name = 7;
+  string fov = 8;
+  string width = 9;
+  string height = 10;
+}

@@ -6,6 +6,7 @@ import uuid
 from typing import Any
 
 import grpc
+from google.protobuf import struct_pb2
 from loguru import logger
 
 from arenaagent.agent_base import pack_data_to_struct, parse_struct_to_data
@@ -43,6 +44,15 @@ class TongSimGrpcClient(TongSimInterface):
 
     def _call(self, method_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         rpc = getattr(self._stub, method_name)
+        return parse_struct_to_data(rpc(pack_data_to_struct(payload), metadata=self._metadata))
+
+    def _call_compat_path(self, method_path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Call an RPC added by newer servers without regenerating shared stubs."""
+        rpc = self._channel.unary_unary(
+            method_path,
+            request_serializer=struct_pb2.Struct.SerializeToString,
+            response_deserializer=struct_pb2.Struct.FromString,
+        )
         return parse_struct_to_data(rpc(pack_data_to_struct(payload), metadata=self._metadata))
 
     def _heartbeat_loop(self) -> None:
@@ -122,6 +132,23 @@ class TongSimGrpcClient(TongSimInterface):
     # ------------------------------------------------------------------ #
     # Perception
     # ------------------------------------------------------------------ #
+
+    def acquire_first_person_perception(
+        self,
+        character_id,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> dict[str, Any]:
+        """Use ZRQ's atomic image/object perception RPC when available."""
+        payload: dict[str, Any] = {"character_id": str(character_id)}
+        if width is not None:
+            payload["width"] = int(width)
+        if height is not None:
+            payload["height"] = int(height)
+        return self._call_compat_path(
+            "/tongsim.service.TongSimService/acquire_first_person_perception",
+            payload,
+        )
 
     def acquire_first_person_image(self, character_id, encode_base64: bool = True):
         # Always returns base64 str from server; _decode_image() in SemanticMapper handles str.

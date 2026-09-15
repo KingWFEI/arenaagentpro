@@ -14,6 +14,8 @@ from arenaagent.generated.arena.message import basic_type_pb2
 from arenaagent.preliminary_baseline_agent.task_registry import create_task_strategy, supported_task_types
 from arenaagent.preliminary_baseline_agent.task_runtime import TaskContext, normalize_task_type
 from arenaagent.preliminary_baseline_agent.tasks.base import TaskStrategy
+from arenaagent.preliminary_baseline_agent.tasks.counting.perception import acquire_counting_perception
+from arenaagent.preliminary_baseline_agent.tasks.counting.runtime import run_counting_subject
 from arenaagent.preliminary_baseline_agent.tasks.jigsaw.runner import run_dedicated_jigsaw
 from arenaagent.preliminary_baseline_agent.tasks.raven.text_client import (
     build_raven_text_client_from_env,
@@ -26,6 +28,17 @@ from arenaagent.vlm_agent.vlm_agent import VLMAgent, VLMAgentCfg
 @configclass
 class PreliminaryBaselineAgentCfg(VLMAgentCfg):
     name: str = "preliminary_baseline_agent"
+    counting_max_model_calls: int = 2
+    counting_move_distance: float = 80.0
+    counting_post_turn_settle_seconds: float = 0.12
+    counting_capture_max_attempts: int = 3
+    counting_image_max_width: int = 1280
+    counting_perception_width: int = 1280
+    counting_perception_height: int = 720
+    counting_clock_closeups: int = 2
+    counting_clock_image_max_width: int = 2000
+    counting_max_recovery_submissions: int = 7
+    counting_corner_move_distance: float = 80.0
 
 
 @Register("preliminary_baseline_agent")
@@ -59,6 +72,7 @@ class PreliminaryBaselineAgent(VLMAgent):
         self._last_executed_action_name = ""
         self._last_executed_action: dict[str, Any] = {}
         self._spawn_xy: tuple[float, float] | None = None
+        self._spawn_yaw: float | None = None
         self._tidyroom_post_turn_diagnostic_sequence = 0
         self._tidyroom_post_turn_perception_blocked = False
         self.raven_text_client = None
@@ -75,6 +89,13 @@ class PreliminaryBaselineAgent(VLMAgent):
                 self._spawn_xy = float(location[0]), float(location[1])
         except (TypeError, ValueError, json.JSONDecodeError):
             logger.warning("Could not parse agent spawn location for route planning: {}", raw_location)
+        raw_rotation = opt.get("spawn_rot")
+        try:
+            rotation = json.loads(raw_rotation) if isinstance(raw_rotation, str) else raw_rotation
+            if isinstance(rotation, (list, tuple)) and len(rotation) >= 3:
+                self._spawn_yaw = float(rotation[2])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            logger.warning("Could not parse agent spawn rotation for counting route: {}", raw_rotation)
         self._seed_tidyroom_start_position()
 
     @property
@@ -88,6 +109,9 @@ class PreliminaryBaselineAgent(VLMAgent):
         """整理房间使用本地快速循环，其他四类任务保持原有服务循环。"""
         subject = self._get_subject_from_task()
         task_type = normalize_task_type(subject)
+        if task_type == "counting":
+            run_counting_subject(self, subject)
+            return
         if task_type == "raven":
             self._run_raven_subject_safely(subject)
             return
@@ -260,6 +284,10 @@ class PreliminaryBaselineAgent(VLMAgent):
         **kwargs: Any,
     ) -> tuple[str | None, list[dict[str, Any]], list[dict[str, Any]]]:
         """转向后只接受分割区域与可见对象映射基本一致的完整感知。"""
+        if normalize_task_type(subject) == "counting":
+            unified = acquire_counting_perception(self, kwargs)
+            if unified is not None:
+                return unified
         is_post_turn_full_capture = bool(
             normalize_task_type(subject) == "tidyroom"
             and self._last_executed_action_name == "turn_in_degree"
@@ -476,6 +504,24 @@ class PreliminaryBaselineAgent(VLMAgent):
             )
             return self._last_apply_resp
         return super()._apply_action(action)
+
+    def _handle_submit_answer(self, params: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+        """Keep ZRQ's integer counting answer without changing other tasks."""
+        if self._active_task_type != "counting":
+            return super()._handle_submit_answer(params, action)
+        key = self.action_space.get("key") or "action"
+        answer: Any = action["output"]
+        answer_type = str(self.action_space.get("type") or "").strip().lower()
+        if answer_type in {"int", "integer"}:
+            if isinstance(answer, str):
+                normalized = answer.strip().upper()
+                try:
+                    answer = int(normalized)
+                except ValueError:
+                    pass
+            elif isinstance(answer, float) and answer.is_integer():
+                answer = int(answer)
+        return {key: answer if answer_type in {"int", "integer"} else str(answer)}
 
     def _build_prompt_variables(
         self,
