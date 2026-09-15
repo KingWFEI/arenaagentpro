@@ -1,0 +1,52 @@
+name: Counting integration CI
+
+on:
+  push:
+    branches:
+      - integration/zrq-counting-20260915
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.12"
+      - name: Install locked dependencies
+        run: uv sync --frozen --no-dev
+      - name: Generate protobuf modules
+        run: uv run --no-sync python scripts/generate_pb2.py
+      - name: Run regression tests
+        run: uv run --no-sync python -m unittest discover -s tests -q
+
+  auto-merge:
+    needs: test
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'integration/zrq-counting-20260915'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Merge only the tested revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+          TESTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          gh pr merge "$PR_NUMBER"
+          --repo "$REPOSITORY"
+          --squash
+          --match-head-commit "$TESTED_HEAD_SHA"
