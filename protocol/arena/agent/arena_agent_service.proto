@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+import "google/protobuf/struct.proto";
+
+import "arena/message/agent_msg.proto";
+import "arena/message/basic_type.proto";
+import "arena/message/session_msg.proto";
+
+package arena.agent;
+
+service TongTestAgentService {
+  rpc update_action(google.protobuf.Struct) returns (google.protobuf.Struct) {}
+  rpc get_action_space(google.protobuf.Struct) returns (google.protobuf.Struct) {
+  }
+
+  rpc generate_subject(google.protobuf.Struct) returns (google.protobuf.Struct) {
+  }
+  rpc get_subject(google.protobuf.Struct) returns (google.protobuf.Struct) {}
+  rpc get_num_subjects(google.protobuf.Struct)
+      returns (arena.message.Int32) {}
+
+  rpc get_response(google.protobuf.Struct) returns (google.protobuf.Struct) {}
+
+  rpc get_task_description(google.protobuf.Struct)
+      returns (google.protobuf.Struct) {}
+
+  rpc evaluate_subject(google.protobuf.Struct) returns (google.protobuf.Struct) {
+  }
+  rpc evaluate_task(google.protobuf.Struct) returns (google.protobuf.Struct) {}
+
+  rpc get_agent_spawn_info(google.protobuf.Struct)
+      returns (arena.message.AgentMsg) {}
+  rpc get_agent_id_in_simulation(google.protobuf.Struct)
+      returns (arena.message.String) {}
+  rpc get_agent_desired_name_in_simulation(google.protobuf.Struct)
+      returns (arena.message.String) {}
+  rpc is_ready_for_agent(google.protobuf.Struct)
+      returns (arena.message.Bool) {}
+  rpc is_current_subject_finished(google.protobuf.Struct)
+      returns (arena.message.Bool) {}
+  rpc get_current_subject_index(google.protobuf.Struct)
+      returns (arena.message.Int32) {}
+
+  rpc connect(google.protobuf.Struct) returns (arena.message.Bool) {}
+  rpc disconnect(google.protobuf.Struct) returns (arena.message.Bool) {}
+  rpc get_current_session(google.protobuf.Struct)
+      returns (arena.message.SessionMsg) {}
+  rpc get_session_status(arena.message.SessionMsg)
+      returns (arena.message.QuerySessionStatusResult) {}
+  rpc stop_session(arena.message.SessionMsg)
+      returns (arena.message.QuerySessionStatusResult) {}
+  rpc get_task_status(google.protobuf.Struct)
+      returns (arena.message.QuerySessionStatusResult) {}
+  rpc get_subject_score(google.protobuf.Struct)
+      returns (google.protobuf.Struct) {}
+
+  // agent competition
+  rpc get_system_help_message_from_task(google.protobuf.Struct)
+      returns (google.protobuf.Struct) {}
+  rpc open_door_using_final_competition(google.protobuf.Struct)
+      returns (google.protobuf.Struct) {}
+  rpc speak_to(google.protobuf.Struct) returns (google.protobuf.Struct) {}
+}

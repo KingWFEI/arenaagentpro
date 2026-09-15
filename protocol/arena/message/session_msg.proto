@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package arena.message;
+
+message SessionMsg {
+  string session_id = 1;           // task_name-agent_name_start-time
+  string agent_name = 2;           // not used
+  string task_name = 3;            // not used
+  string start_time = 4;           // yyyy-MM-dd-HH:mm:ss, 2024-11-13-14:00:00
+  optional bool launch_status = 5; // true: launched, false: not launched
+}
+
+enum SessionStatus {
+  // Task Launch Status 0-99
+  NOT_INITIALIZED = 0;   // The session has no task
+  INITIALIZING = 1;      // The session is initializing one task
+  WAITING_FOR_AGENT = 2; // The session is waiting for the agent to connect
+  // in which, 50-99 are reserved as control flags
+  SUSPENDED = 50;  // The session is suspended, can be resumed
+  RESUMING = 51;   // The session is resuming
+  TERMINATED = 99; // The session is terminated. All resources are released
+
+  // Task Running Status 100-199
+  PENDING = 100;  // The session is waiting for the agent to start the task
+  RUNNING = 101;  // The session is running the task
+  FINISHED = 199; // The session is finished
+
+  // Errors 400-499
+  ERROR = 400; // The session has an error
+}
+
+message QuerySessionStatusResult {
+  SessionMsg session_msg = 1;
+  SessionStatus session_status = 2;
+  optional int32 subject_id = 3; // Activate only when session_status=RUNNING
+}

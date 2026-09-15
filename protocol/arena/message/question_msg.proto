@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+import "arena/message/basic_type.proto";
+
+package arena.message;
+// A question message that is sent to the agent to ask for the agent's action.
+// It is also sent to TongTest backend to display the question to the user.
+// The question message includes the question text and the choices. (for now,
+// only choice-based questions are supported)
+message QuestionMsg {
+  string question_text = 1;
+  repeated Pair options = 2;
+  bool is_reply_received = 3;
+  int32 subject_index = 4;
+  string reply_text = 5;
+  bool is_reply_correct = 6;
+}

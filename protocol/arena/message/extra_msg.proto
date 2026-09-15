@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+import "google/protobuf/struct.proto";
+import "arena/message/basic_type.proto";
+
+package arena.message;
+// Additional information message helping the user/agent to understand the task
+// and find the solution. We use google.protobuf.Struct to represent the
+// information message.
+message ExtraInfoList { repeated Pair extra_info = 1; }
+message ExtraMsg {
+  google.protobuf.Struct extra_msg = 1;
+  ExtraInfoList extra_info_list = 2;
+}
