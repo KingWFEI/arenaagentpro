@@ -67,6 +67,61 @@ class FakeTongSim:
         return {"result": "success"}
 
 
+class FakeLegacyTongSim(FakeTongSim):
+    def __init__(self, objects: list[dict]) -> None:
+        super().__init__(objects)
+        self.objects = objects
+        self._stub = type("LegacyStub", (), {"acquire_first_person_perception": object()})()
+
+    def acquire_first_person_perception(self, character_id: str, width: int, height: int) -> dict:
+        self.calls.append(("capture", width, height))
+        return {"image": "test-image", "objects": self.objects}
+
+    def move_and_take_object(
+        self,
+        character_id: str,
+        object_id: str,
+        which_hand: int = 0,
+        movable_object_ids=None,
+    ) -> dict:
+        self.calls.append(("take", object_id, which_hand, tuple(movable_object_ids or [])))
+        self.hands[which_hand] = object_id
+        return {"result": "success"}
+
+    def move_and_take_puzzle_piece(self, character_id: str, piece_object_id: str, which_hand: int = 0) -> dict:
+        self.calls.append(("puzzle_take", piece_object_id, which_hand))
+        self.hands[which_hand] = piece_object_id
+        return {"result": "success"}
+
+    def has_object_in_hand(self, character_id: str):
+        if not self.hands:
+            return False, None
+        return True, min(self.hands)
+
+    def put_down_sth(self, character_id: str, target_location: list[float], **kwargs) -> dict:
+        held = self.hands.pop(min(self.hands))
+        self.calls.append(("legacy_place", held, tuple(target_location), kwargs))
+        self.locations[held] = dict(zip(("X", "Y", "Z"), target_location))
+        return {"result": "success"}
+
+    def turn_in_degree(self, character_id: str, degree: float) -> dict:
+        self.calls.append(("turn", degree))
+        return {"result": "success"}
+
+    def move_and_put_down(
+        self,
+        character_id: str,
+        move_target_location: list[float],
+        put_target_location: list[float],
+        which_hand: int = 0,
+        put_rotation=None,
+    ) -> dict:
+        held = self.hands.pop(which_hand)
+        self.calls.append(("explicit_place", held, tuple(put_target_location), which_hand, put_rotation))
+        self.locations[held] = dict(zip(("X", "Y", "Z"), put_target_location))
+        return {"result": "success"}
+
+
 class JigsawTransferTests(unittest.TestCase):
     def setUp(self) -> None:
         # The missing cells are top-right, middle-left, bottom-middle.
@@ -80,7 +135,7 @@ class JigsawTransferTests(unittest.TestCase):
         self.assertEqual({cell.name for cell in layout.empty_cells}, {"top-right", "middle-left", "bottom-middle"})
         self.assertEqual({obj["object_id"] for obj in layout.candidates}, {"7", "8", "9"})
 
-    def test_runner_uses_raw_ids_and_places_three_tiles(self) -> None:
+    def test_runner_uses_raw_ids_and_two_hands_when_release_hand_is_explicit(self) -> None:
         class FakeAgent:
             character_id = "character"
             semantic_mapper = FakeMapper()
@@ -107,7 +162,7 @@ class JigsawTransferTests(unittest.TestCase):
                          [("piece-7", 0), ("piece-8", 1), ("piece-9", 0)])
         self.assertEqual(agent.tongsim.hands, {})
 
-    def test_failed_second_hand_prefetch_falls_back_to_sequential_take(self) -> None:
+    def test_single_hand_path_is_unaffected_by_second_hand_failure(self) -> None:
         class FakeAgent:
             character_id = "character"
             semantic_mapper = FakeMapper()
@@ -129,6 +184,61 @@ class JigsawTransferTests(unittest.TestCase):
                          [("piece-7", 0), ("piece-8", 1), ("piece-8", 0), ("piece-9", 0)])
         self.assertEqual([(call[1], call[3]["which_hand"]) for call in agent.tongsim.calls if call[0] == "place"],
                          [("piece-7", 0), ("piece-8", 0), ("piece-9", 0)])
+
+    def test_legacy_competition_server_path_uses_1280_capture_and_old_place_rpc(self) -> None:
+        class FakeAgent:
+            character_id = "character"
+            semantic_mapper = object()
+
+        agent = FakeAgent()
+        agent.tongsim = FakeLegacyTongSim(self.objects)
+        mapping = [
+            {"object_id": "7", "cell": "top-right"},
+            {"object_id": "8", "cell": "middle-left"},
+            {"object_id": "9", "cell": "bottom-middle"},
+        ]
+        with patch("arenaagent.preliminary_baseline_agent.tasks.jigsaw.runner.solve_by_image_cost", return_value=mapping):
+            run_dedicated_jigsaw(agent, self.subject)
+
+        self.assertIn(("capture", 1280, 720), agent.tongsim.calls)
+        self.assertEqual(len([call for call in agent.tongsim.calls if call[0] == "legacy_place"]), 3)
+        self.assertEqual(
+            [(call[1], call[2]) for call in agent.tongsim.calls if call[0] == "take"],
+            [("7", 0), ("8", 0), ("9", 0)],
+        )
+
+    def test_legacy_path_normalizes_only_board_rotation_outliers(self) -> None:
+        class FakeAgent:
+            character_id = "character"
+            semantic_mapper = object()
+
+        for obj in self.objects[:6]:
+            obj["rotation"] = {"roll": 0.0, "pitch": 0.0, "yaw": 90.0}
+        self.objects[2]["rotation"] = {"roll": 0.0, "pitch": 90.0, "yaw": 0.0}
+        agent = FakeAgent()
+        agent.tongsim = FakeLegacyTongSim(self.objects)
+        mapping = [
+            {"object_id": "7", "cell": "top-right"},
+            {"object_id": "8", "cell": "middle-left"},
+            {"object_id": "9", "cell": "bottom-middle"},
+        ]
+        with patch("arenaagent.preliminary_baseline_agent.tasks.jigsaw.runner.solve_by_image_cost", return_value=mapping):
+            run_dedicated_jigsaw(agent, self.subject)
+
+        takes = [(call[1], call[2]) for call in agent.tongsim.calls if call[0] == "take"]
+        self.assertEqual(takes, [("7", 0), ("8", 0), ("9", 0), ("3", 0)])
+        normalized = [call for call in agent.tongsim.calls if call[0] == "legacy_place" and call[1] == "3"]
+        self.assertEqual(len(normalized), 1)
+        self.assertEqual(normalized[0][2], (837.0, 20.0, 20.0))
+        self.assertEqual(normalized[0][3]["target_rotation"].yaw, 90.0)
+
+    def test_rotation_uses_an_observed_board_pose_across_yaw_wraparound(self) -> None:
+        rotations = [179.0, -179.0, 178.0, -178.0, 180.0, -180.0]
+        for obj, yaw in zip(self.objects[:6], rotations):
+            obj["rotation"] = {"roll": 0.0, "pitch": 0.0, "yaw": yaw}
+        layout = infer_layout(self.objects, self.subject["reference_bounding"])
+        self.assertIn(layout.target_rotation["yaw"], rotations)
+        self.assertGreater(abs(layout.target_rotation["yaw"]), 170.0)
 
     def test_image_cost_matches_three_distinct_reference_colors(self) -> None:
         layout = infer_layout(self.objects, self.subject["reference_bounding"])

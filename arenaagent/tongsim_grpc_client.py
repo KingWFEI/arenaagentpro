@@ -6,7 +6,6 @@ import uuid
 from typing import Any
 
 import grpc
-from google.protobuf import struct_pb2
 from loguru import logger
 
 from arenaagent.agent_base import pack_data_to_struct, parse_struct_to_data
@@ -44,15 +43,6 @@ class TongSimGrpcClient(TongSimInterface):
 
     def _call(self, method_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         rpc = getattr(self._stub, method_name)
-        return parse_struct_to_data(rpc(pack_data_to_struct(payload), metadata=self._metadata))
-
-    def _call_compat_path(self, method_path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Call an RPC added by newer servers without regenerating shared stubs."""
-        rpc = self._channel.unary_unary(
-            method_path,
-            request_serializer=struct_pb2.Struct.SerializeToString,
-            response_deserializer=struct_pb2.Struct.FromString,
-        )
         return parse_struct_to_data(rpc(pack_data_to_struct(payload), metadata=self._metadata))
 
     def _heartbeat_loop(self) -> None:
@@ -139,16 +129,20 @@ class TongSimGrpcClient(TongSimInterface):
         width: int | None = None,
         height: int | None = None,
     ) -> dict[str, Any]:
-        """Use ZRQ's atomic image/object perception RPC when available."""
+        """Compatibility capture for the competition's legacy TongSim server."""
         payload: dict[str, Any] = {"character_id": str(character_id)}
         if width is not None:
-            payload["width"] = int(width)
+            payload["width"] = width
         if height is not None:
-            payload["height"] = int(height)
-        return self._call_compat_path(
-            "/tongsim.service.TongSimService/acquire_first_person_perception",
-            payload,
-        )
+            payload["height"] = height
+        return self._call("acquire_first_person_perception", payload)
+
+    def has_object_in_hand(self, character_id) -> tuple[bool, int | None]:
+        """Return the hand selected by the competition's legacy placement RPC."""
+        result = self._call("has_object_in_hand", {"character_id": str(character_id)})
+        has_object = bool(result.get("has_object", False))
+        hand_idx = result.get("hand_idx")
+        return has_object, int(hand_idx) if hand_idx is not None else None
 
     def acquire_first_person_image(self, character_id, encode_base64: bool = True):
         # Always returns base64 str from server; _decode_image() in SemanticMapper handles str.
@@ -204,7 +198,6 @@ class TongSimGrpcClient(TongSimInterface):
                 "execute_immediately": execute_immediately,
             },
         )
-
     def look_at_object(self, character_id, object_id: str, is_cancel: bool = False):
         return self._call(
             "look_at_object",
@@ -258,12 +251,30 @@ class TongSimGrpcClient(TongSimInterface):
             },
         )
 
-    def move_and_take_object(self, character_id, object_id: str, which_hand: int = 0):
+    def move_and_take_object(
+        self,
+        character_id,
+        object_id: str,
+        which_hand: int = 0,
+        movable_object_ids: list[str] | None = None,
+    ):
         return self._call(
             "move_and_take_object",
             {
                 "character_id": str(character_id),
                 "object_id": object_id,
+                "which_hand": which_hand,
+                "movable_object_ids": movable_object_ids,
+            },
+        )
+
+    def move_and_take_puzzle_piece(self, character_id, piece_object_id: str, which_hand: int = 0):
+        """Use the competition server's puzzle-specific move-and-grab action."""
+        return self._call(
+            "move_and_take_puzzle_piece",
+            {
+                "character_id": str(character_id),
+                "piece_object_id": piece_object_id,
                 "which_hand": which_hand,
             },
         )
@@ -280,6 +291,33 @@ class TongSimGrpcClient(TongSimInterface):
     # ------------------------------------------------------------------ #
     # Object manipulation
     # ------------------------------------------------------------------ #
+
+    def put_down_sth(
+        self,
+        character_id,
+        target_location,
+        target_rotation: Rotation | None = None,
+        auto_rotate: bool = False,
+        force_locate: bool = False,
+    ):
+        """Compatibility placement for the competition's legacy TongSim server."""
+        rot_dict = None
+        if target_rotation is not None:
+            rot_dict = {
+                "roll": target_rotation.roll,
+                "yaw": target_rotation.yaw,
+                "pitch": target_rotation.pitch,
+            }
+        return self._call(
+            "put_down_sth",
+            {
+                "character_id": str(character_id),
+                "target_location": target_location,
+                "target_rotation": rot_dict,
+                "auto_rotate": auto_rotate,
+                "force_locate": force_locate,
+            },
+        )
 
     def put_down_to_location(
         self,

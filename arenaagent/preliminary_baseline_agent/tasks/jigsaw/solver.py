@@ -22,6 +22,7 @@ class JigsawCell:
 @dataclass(frozen=True)
 class JigsawLayout:
     candidates: tuple[dict[str, Any], ...]
+    placed: tuple[dict[str, Any], ...]
     empty_cells: tuple[JigsawCell, ...]
     target_rotation: dict[str, float]
 
@@ -58,6 +59,46 @@ def _cluster(values: list[float], tolerance: float = 1.5) -> list[float]:
         else:
             clusters[-1].append(value)
     return [sum(group) / len(group) for group in clusters]
+
+
+def _angular_distance(left: float, right: float) -> float:
+    """Smallest distance between two Euler components, accounting for wraparound."""
+    return abs((left - right + 180.0) % 360.0 - 180.0)
+
+
+def _representative_rotation(rotations: list[dict[str, Any]]) -> dict[str, float]:
+    """Choose an observed board-tile rotation instead of mixing Euler components."""
+    axes = ("roll", "pitch", "yaw")
+    observed = [
+        {axis: float(rotation.get(axis, 0.0)) for axis in axes}
+        for rotation in rotations
+    ]
+    if not observed:
+        return {axis: 0.0 for axis in axes}
+    return min(
+        observed,
+        key=lambda candidate: (
+            sum(
+                _angular_distance(candidate[axis], other[axis])
+                for other in observed
+                for axis in axes
+            ),
+            # Break even-sized cluster ties in favour of the configured board
+            # orientation. This matters when three UE Euler decompositions use
+            # pitch +/-90 while the other three use yaw +90.
+            _angular_distance(candidate["roll"], 0.0)
+            + _angular_distance(candidate["pitch"], 0.0)
+            + _angular_distance(candidate["yaw"], 90.0),
+        ),
+    )
+
+
+def rotation_distance(left: dict[str, Any], right: dict[str, Any]) -> float:
+    """Circular L1 distance between two roll/pitch/yaw representations."""
+    return sum(
+        _angular_distance(float(left.get(axis, 0.0)), float(right.get(axis, 0.0)))
+        for axis in ("roll", "pitch", "yaw")
+    )
 
 
 def infer_layout(objects: list[dict[str, Any]], reference_bounding: list[Any]) -> JigsawLayout:
@@ -113,11 +154,13 @@ def infer_layout(objects: list[dict[str, Any]], reference_bounding: list[Any]) -
         raise ValueError(f"expected 3 loose candidate tiles, found {len(candidates)}")
 
     rotations = [obj.get("rotation", {}) for obj in placed]
-    target_rotation = {
-        key: float(median(float(rotation.get(key, 0.0)) for rotation in rotations))
-        for key in ("roll", "pitch", "yaw")
-    }
-    return JigsawLayout(candidates=tuple(candidates), empty_cells=empty_cells, target_rotation=target_rotation)
+    target_rotation = _representative_rotation(rotations)
+    return JigsawLayout(
+        candidates=tuple(candidates),
+        placed=tuple(placed),
+        empty_cells=empty_cells,
+        target_rotation=target_rotation,
+    )
 
 
 def _decode_combined_image(image_b64: str) -> np.ndarray:
