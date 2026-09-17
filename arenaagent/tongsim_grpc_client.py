@@ -6,6 +6,7 @@ import uuid
 from typing import Any
 
 import grpc
+from google.protobuf import struct_pb2
 from loguru import logger
 
 from arenaagent.agent_base import pack_data_to_struct, parse_struct_to_data
@@ -43,6 +44,14 @@ class TongSimGrpcClient(TongSimInterface):
 
     def _call(self, method_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         rpc = getattr(self._stub, method_name)
+        return parse_struct_to_data(rpc(pack_data_to_struct(payload), metadata=self._metadata))
+
+    def _call_legacy(self, method_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        rpc = self._channel.unary_unary(
+            f"/tongsim.service.TongSimService/{method_name}",
+            request_serializer=struct_pb2.Struct.SerializeToString,
+            response_deserializer=struct_pb2.Struct.FromString,
+        )
         return parse_struct_to_data(rpc(pack_data_to_struct(payload), metadata=self._metadata))
 
     def _heartbeat_loop(self) -> None:
@@ -230,6 +239,16 @@ class TongSimGrpcClient(TongSimInterface):
                 "character_id": str(character_id),
                 "target_location": target_location,
                 "stop_distance": stop_distance,
+            },
+        )
+
+    def move_to_npc(self, character_id, asset_name: str):
+        """Use the competition server's legacy NPC movement RPC."""
+        return self._call_legacy(
+            "move_to_npc",
+            {
+                "character_id": str(character_id),
+                "name": str(asset_name),
             },
         )
 
