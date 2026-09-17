@@ -8,9 +8,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import grpc
+from google.protobuf import struct_pb2
 from loguru import logger
 from PIL import Image
 
+from arenaagent.agent_base import pack_data_to_struct, parse_struct_to_data
 from arenaagent.preliminary_baseline_agent.task_runtime import TaskContext
 from arenaagent.preliminary_baseline_agent.tasks.base import TaskStrategy, action_succeeded
 from arenaagent.vlm_agent.json_parsor import extract_last_json_from_text
@@ -65,6 +68,11 @@ _RELIABLE_PUBLIC_LABELS = {"bottle", "bowl", "chair", "cup"}
 # geometric public labels.  Finish the translated scan before spending a VLM
 # call, so newly exposed instances are reviewed in the same request.
 _DEFER_REVIEW_UNTIL_AFTER_EXPLORATION = {"apple", "backpack", "clock", "cup"}
+
+# A complete spawn-point panorama was reliable for these large, consistently
+# labelled assets in scored runs. Bottles remain excluded because a prior
+# two-vs-three undercount proved that one can hide behind furniture.
+_SAFE_FULL_PANORAMA_FAST = {"bowl", "chair"}
 
 
 def _normalise_label(value: Any) -> str:
@@ -412,6 +420,8 @@ class CountingStrategy(TaskStrategy):
         self.model_calls = 0
         self.exploration_moves = 0
         self.review_votes: dict[str, list[tuple[str, float]]] = {}
+        self.observation_xy: tuple[float, float] | None = None
+        self.atomic_perception_supported = True
 
     def observe(self, context: TaskContext) -> None:
         super().observe(context)
@@ -476,21 +486,27 @@ class CountingStrategy(TaskStrategy):
             self.model_calls,
         )
 
-        # The corner's two 120-degree views cover the room's inward 90-degree
-        # sector with overlap.  A uniquely mappable exact count does not need a
-        # slow physical occlusion tour.  Ambiguous scenes retain that tour.
-        option = (
-            option_for_count(len(initial_exact), subject.get("options"))
-            if use_semantic_fast_path
-            else None
-        )
+        # Angular coverage is not the same as visibility: the first scored
+        # corner run saw four apples while a fifth remained behind furniture.
+        # Only trust the two-view count when no sizeable occluder was observed.
+        plan = self._select_occlusion_plan(agent)
+        option = None
+        if use_semantic_fast_path and (
+            plan is None or (not corner_ready and category in _SAFE_FULL_PANORAMA_FAST)
+        ):
+            option = option_for_count(len(initial_exact), subject.get("options"))
         if option is not None:
             logger.info(
-                "Counting early semantic stop category={} count={} after panorama; skip occlusion movement",
+                "Counting unobstructed semantic stop category={} count={}; skip occlusion movement",
                 category,
                 len(initial_exact),
             )
-        if option is None and corner_ready and category in _DEFER_REVIEW_UNTIL_AFTER_EXPLORATION:
+        if (
+            option is None
+            and plan is None
+            and corner_ready
+            and category in _DEFER_REVIEW_UNTIL_AFTER_EXPLORATION
+        ):
             # From the released spawn point the right-hand corner sees the room
             # inside a 90-degree sector.  Two overlapping 120-degree views are
             # enough for strong local prototypes; avoid the old second 360°
@@ -508,16 +524,30 @@ class CountingStrategy(TaskStrategy):
                         time.monotonic() - started,
                     )
         if option is None:
-            plan = self._select_occlusion_plan(agent)
             moved, anchor_heading = self._move_to_occlusion_zone(agent, subject, plan)
             if moved:
                 self.exploration_moves += 1
                 if category in _DEFER_REVIEW_UNTIL_AFTER_EXPLORATION:
-                    # Do not stop after two empty headings. Small targets can
-                    # sit on the opposite side of the bed/furniture; the failed
-                    # five-apple run missed the target that a successful 270°
-                    # view had observed in an earlier run.
-                    self._capture_full_post_move_scan(agent, subject, category, full_headings)
+                    if corner_ready:
+                        # Experimental corner route: use the translated
+                        # complementary views rather than another corner spin.
+                        self._capture_directed_occlusion_views(
+                            agent,
+                            subject,
+                            category,
+                            anchor_heading,
+                            keep_searching=True,
+                        )
+                    else:
+                        # Conservative scored route. This is the previously
+                        # proven 4-heading post-translation scan that achieved
+                        # the higher first-attempt accuracy.
+                        self._capture_full_post_move_scan(
+                            agent,
+                            subject,
+                            category,
+                            full_headings,
+                        )
                 else:
                     self._capture_directed_occlusion_views(
                         agent,
@@ -594,6 +624,9 @@ class CountingStrategy(TaskStrategy):
 
     def _move_to_observation_corner(self, agent: Any) -> tuple[bool, tuple[float, float]]:
         """Move once to the spawn's right-hand corner and return inward headings."""
+        if not bool(getattr(agent.cfg, "counting_use_corner_route", False)):
+            logger.info("Counting conservative route enabled; keep spawn panorama")
+            return False, (90.0, 180.0)
         spawn = getattr(agent, "_spawn_xy", None)
         yaw = getattr(agent, "_spawn_yaw", None)
         if not isinstance(spawn, (tuple, list)) or len(spawn) < 2 or yaw is None:
@@ -623,6 +656,7 @@ class CountingStrategy(TaskStrategy):
         if not action_succeeded(result):
             logger.warning("Counting corner move failed; use spawn panorama: {}", result)
             return False, (90.0, 180.0)
+        self.observation_xy = (target["X"], target["Y"])
         headings = ((right_heading + 90.0) % 360.0, (right_heading + 180.0) % 360.0)
         logger.info(
             "Counting moved to right observation corner target={} inward_headings={}",
@@ -703,7 +737,15 @@ class CountingStrategy(TaskStrategy):
             candidate_ids = self.memory.candidate_ids(category)
             if candidate_ids:
                 positive_count, expectation = self._fuse_votes(candidate_ids)
-                preferred.extend((positive_count, round(expectation)))
+                # With no accepted target votes, zero is merely the fusion
+                # default—not credible evidence.  Putting it first caused an
+                # avoidable second wrong submission after a 4-vs-5 undercount.
+                has_review_votes = any(self.review_votes.get(object_id) for object_id in candidate_ids)
+                if positive_count > 0 or has_review_votes:
+                    preferred.append(positive_count)
+                expected_count = round(expectation)
+                if expected_count > 0:
+                    preferred.append(expected_count)
 
         ranked: list[int] = []
         for value in preferred:
@@ -751,7 +793,7 @@ class CountingStrategy(TaskStrategy):
         for attempt in range(1, max_attempts + 1):
             if settle:
                 time.sleep(settle)
-            capture = agent._acquire_camera_perception(subject, is_save=True)
+            capture = self._acquire_counting_perception(agent, subject)
             diagnostics = dict(
                 getattr(getattr(agent, "semantic_mapper", None), "last_perception_diagnostics", {})
                 or {}
@@ -786,6 +828,67 @@ class CountingStrategy(TaskStrategy):
             len(self.memory.records),
         )
         return view
+
+    def _acquire_counting_perception(
+        self,
+        agent: Any,
+        subject: dict[str, Any],
+    ) -> tuple[str | None, list[dict[str, Any]], list[dict[str, Any]]]:
+        """Capture RGB and objects atomically without changing shared task code."""
+        client = getattr(agent, "tongsim", None)
+        channel = getattr(client, "_channel", None)
+        if self.atomic_perception_supported and channel is not None:
+            width = max(int(getattr(agent.cfg, "counting_perception_width", 1280)), 1)
+            height = max(int(getattr(agent.cfg, "counting_perception_height", 720)), 1)
+            rpc = channel.unary_unary(
+                "/tongsim.service.TongSimService/acquire_first_person_perception",
+                request_serializer=struct_pb2.Struct.SerializeToString,
+                response_deserializer=struct_pb2.Struct.FromString,
+            )
+            try:
+                response = rpc(
+                    pack_data_to_struct(
+                        {
+                            "character_id": str(agent.character_id),
+                            "width": width,
+                            "height": height,
+                        }
+                    ),
+                    metadata=getattr(client, "_metadata", None),
+                )
+                perception = parse_struct_to_data(response)
+                objects = [
+                    dict(item)
+                    for item in perception.get("objects", [])
+                    if isinstance(item, dict)
+                ]
+                visible = [
+                    {
+                        "object_id": str(item["object_id"]),
+                        "source_object_id": str(item["object_id"]),
+                    }
+                    for item in objects
+                    if item.get("object_id") is not None
+                ]
+                mapper = getattr(agent, "semantic_mapper", None)
+                if mapper is not None:
+                    mapper.last_perception_diagnostics = {}
+                image = perception.get("image")
+                logger.debug(
+                    "Counting unified perception image_size={} visible_objects={}",
+                    len(image) if isinstance(image, str) else 0,
+                    len(objects),
+                )
+                return image, visible, objects
+            except grpc.RpcError as exc:
+                if exc.code() != grpc.StatusCode.UNIMPLEMENTED:
+                    raise
+                self.atomic_perception_supported = False
+                logger.warning(
+                    "TongSim server lacks unified perception RPC; falling back to legacy split perception"
+                )
+
+        return agent._acquire_camera_perception(subject, is_save=True)
 
     @staticmethod
     def _perception_is_consistent(diagnostics: dict[str, Any]) -> tuple[bool, str]:
@@ -859,6 +962,50 @@ class CountingStrategy(TaskStrategy):
         anchor_heading = plan.heading if plan is not None else 270.0
         action = None
         if plan is not None:
+            # move_to_object approaches the near face of a bed/table.  From the
+            # corner this preserves almost the same line of sight, which is why
+            # the scored apple run still saw only three of five instances.
+            # Navigate beyond the blocker to create a genuine cross-room view.
+            record = self.memory.records.get(plan.object_id)
+            origin = self.observation_xy
+            if record is not None and record.position is not None and record.size is not None and origin:
+                cx, cy, _ = record.position
+                dx = cx - origin[0]
+                dy = cy - origin[1]
+                norm = math.hypot(dx, dy)
+                if norm > 1.0:
+                    ux, uy = dx / norm, dy / norm
+                    sx, sy, _ = record.size
+                    projected_half_extent = 0.5 * (abs(ux) * sx + abs(uy) * sy)
+                    clearance = max(
+                        30.0,
+                        min(float(getattr(agent.cfg, "counting_occlusion_clearance", 70.0)), 120.0),
+                    )
+                    far_target = {
+                        "X": cx + ux * (projected_half_extent + clearance),
+                        "Y": cy + uy * (projected_half_extent + clearance),
+                        "Z": 0.0,
+                    }
+                    far_action = {
+                        "action": "move_to_location",
+                        "parameters": {"target_location": far_target, "stop_distance": 8.0},
+                        "output": 0,
+                    }
+                    far_result = agent._execute_action_and_record(far_action)
+                    if action_succeeded(far_result):
+                        self.observation_xy = (far_target["X"], far_target["Y"])
+                        logger.info(
+                            "Counting crossed to far side of occluder object={} target={}",
+                            plan.object_id,
+                            far_target,
+                        )
+                        return True, anchor_heading
+                    logger.warning(
+                        "Counting far-side navigation failed for object={}; fall back to near-side approach: {}",
+                        plan.object_id,
+                        far_result,
+                    )
+
             source_id = None
             current_view = self.memory.views[-1] if self.memory.views else None
             if (
@@ -894,10 +1041,13 @@ class CountingStrategy(TaskStrategy):
         *,
         keep_searching: bool,
     ) -> None:
+        # From close range the anchor direction usually points straight into
+        # the occluding bed/table and yields a nearly empty frame.  Look around
+        # both sides first, then away from it for the complementary room view.
         headings = (
-            anchor_heading % 360.0,
             (anchor_heading - 60.0) % 360.0,
             (anchor_heading + 60.0) % 360.0,
+            (anchor_heading + 180.0) % 360.0,
         )
         consecutive_without_new = 0
         for index, heading in enumerate(headings, start=1):
