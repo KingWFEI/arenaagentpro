@@ -39,7 +39,8 @@ def run_npc_fast_step(
 
     messages = strategy.decision_messages()
     agent._save_prompt_messages(messages)
-    response = agent.vlm_client.invoke(messages) if agent.vlm_client else None
+    text_client = getattr(agent, "npc_text_client", None) or agent.vlm_client
+    response = text_client.invoke(messages) if text_client else None
     response_text = getattr(response, "text", None) or ""
     parsed = extract_last_json_from_text(response_text)
     agent.last_json_parse_message = parsed

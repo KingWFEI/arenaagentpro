@@ -18,6 +18,9 @@ from arenaagent.preliminary_baseline_agent.tasks.counting.runtime import run_cou
 from arenaagent.preliminary_baseline_agent.tasks.jigsaw.runner import run_dedicated_jigsaw
 from arenaagent.preliminary_baseline_agent.tasks.npc.runner import run_npc_fast_step
 from arenaagent.preliminary_baseline_agent.tasks.npc.strategy import NpcStrategy
+from arenaagent.preliminary_baseline_agent.tasks.npc.text_client import (
+    build_npc_text_client_from_env,
+)
 from arenaagent.preliminary_baseline_agent.tasks.raven.text_client import (
     build_raven_text_client_from_env,
 )
@@ -77,6 +80,8 @@ class PreliminaryBaselineAgent(VLMAgent):
         self._tidyroom_post_turn_perception_blocked = False
         self.raven_text_client = None
         self._raven_text_client_initialized = False
+        self.npc_text_client = None
+        self._npc_text_client_initialized = False
         self._jigsaw_attempt_subject_key: tuple[str, str] | None = None
 
     def init(self, opt: dict[str, Any]) -> None:
@@ -268,6 +273,9 @@ class PreliminaryBaselineAgent(VLMAgent):
         if task_type == "raven" and not self._raven_text_client_initialized:
             self.raven_text_client = build_raven_text_client_from_env()
             self._raven_text_client_initialized = True
+        if task_type == "npc" and not self._npc_text_client_initialized:
+            self.npc_text_client = build_npc_text_client_from_env()
+            self._npc_text_client_initialized = True
         safe_subject = dict(subject) if isinstance(subject, dict) else {"subject": str(subject)}
         identity = str(
             safe_subject.get("subject_id")

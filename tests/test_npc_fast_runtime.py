@@ -1,12 +1,11 @@
 import unittest
 
-from google.protobuf import json_format, struct_pb2
+from google.protobuf import struct_pb2
 
 from arenaagent.preliminary_baseline_agent.preliminary_baseline_agent import (
     PreliminaryBaselineAgent,
     PreliminaryBaselineAgentCfg,
 )
-from arenaagent.tongsim_grpc_client import TongSimGrpcClient
 from arenaagent.vlm_agent.client import ClientResponse
 
 
@@ -15,18 +14,18 @@ class CameraMustNotRun:
         raise AssertionError("NPC runtime must not acquire camera perception")
 
 
-class LegacyNpcTongSim:
+class FakeNpcTongSim:
     def __init__(self) -> None:
         self.moves: list[tuple[str, str]] = []
 
     def get_object_in_hand(self, *args, **kwargs):
         raise AssertionError("NPC runtime must not query the held object")
 
-    def get_object_id_by_name(self, *args, **kwargs):
-        raise AssertionError("Legacy NPC movement must not query object IDs")
+    def get_object_id_by_name(self, name: str) -> str:
+        return f"object-{name}"
 
-    def move_to_npc(self, character_id: str, asset_name: str) -> dict:
-        self.moves.append((character_id, asset_name))
+    def move_to_object(self, character_id: str, object_id: str) -> dict:
+        self.moves.append((character_id, object_id))
         return {"result": "success"}
 
 
@@ -42,29 +41,14 @@ class StaticDecisionClient:
         )
 
 
-class LegacyRpcChannel:
-    def __init__(self) -> None:
-        self.path = ""
-        self.payload = None
-        self.metadata = None
-
-    def unary_unary(self, path, *, request_serializer, response_deserializer):
-        del request_serializer, response_deserializer
-        self.path = path
-
-        def invoke(request, *, metadata):
-            self.payload = json_format.MessageToDict(request)
-            self.metadata = metadata
-            response = struct_pb2.Struct()
-            response.update({"result": "success"})
-            return response
-
-        return invoke
+class VisualClientMustNotDecide:
+    def invoke(self, messages):
+        raise AssertionError("NPC final decision must not use the visual client when a text decider exists")
 
 
 class NpcFastRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tongsim = LegacyNpcTongSim()
+        self.tongsim = FakeNpcTongSim()
         self.agent = PreliminaryBaselineAgent(None, None, cfg=PreliminaryBaselineAgentCfg())
         self.agent._initialized = True
         self.agent.character_id = "character-1"
@@ -72,6 +56,9 @@ class NpcFastRuntimeTests(unittest.TestCase):
         self.agent.semantic_mapper = CameraMustNotRun()
         self.agent.action_space = {"key": "answer"}
         self.agent.vlm_client = StaticDecisionClient()
+        # Mark the decider as resolved so tests never build a real network client.
+        self.agent.npc_text_client = None
+        self.agent._npc_text_client_initialized = True
         self.agent._save_prompt_messages = lambda messages: None
         self.asked_names: list[str] = []
 
@@ -98,12 +85,12 @@ class NpcFastRuntimeTests(unittest.TestCase):
             },
         }
 
-    def test_first_npc_step_skips_camera_and_uses_legacy_npc_movement(self) -> None:
+    def test_first_npc_step_skips_camera_and_moves_to_npc_object(self) -> None:
         result = self.agent.run_step(self.subject, {})
 
         self.assertEqual("江淑艳", result["npc_name"])
         self.assertEqual(["江淑艳"], self.asked_names)
-        self.assertEqual([("character-1", "asset-jiang")], self.tongsim.moves)
+        self.assertEqual([("character-1", "object-asset-jiang")], self.tongsim.moves)
         self.assertIsNone(self.agent.vlm_client.messages)
 
     def test_final_npc_decision_uses_ordered_text_only_evidence(self) -> None:
@@ -120,22 +107,18 @@ class NpcFastRuntimeTests(unittest.TestCase):
         self.assertNotIn("image_url", str(messages))
         self.assertLess(str(messages).index("江淑艳"), str(messages).index("张奶奶"))
 
-    def test_tongsim_client_can_call_legacy_move_to_npc_rpc(self) -> None:
-        channel = LegacyRpcChannel()
-        client = TongSimGrpcClient.__new__(TongSimGrpcClient)
-        client._channel = channel
-        client._metadata = (("x-tongsim-client-id", "test-client"),)
+    def test_final_decision_prefers_independent_text_decider(self) -> None:
+        decider = StaticDecisionClient()
+        self.agent.npc_text_client = decider
+        self.agent.vlm_client = VisualClientMustNotDecide()
 
-        self.assertTrue(hasattr(client, "move_to_npc"), "缺少旧版 move_to_npc 兼容入口")
-        result = client.move_to_npc("character-1", "asset-jiang")
+        for _ in range(4):
+            self.agent.run_step(self.subject, {})
 
-        self.assertEqual("/tongsim.service.TongSimService/move_to_npc", channel.path)
-        self.assertEqual(
-            {"character_id": "character-1", "name": "asset-jiang"},
-            channel.payload,
-        )
-        self.assertEqual((("x-tongsim-client-id", "test-client"),), channel.metadata)
-        self.assertEqual({"result": "success"}, result)
+        result = self.agent.run_step(self.subject, {})
+
+        self.assertEqual({"answer": "张奶奶"}, result)
+        self.assertIsNotNone(decider.messages, "文本决策客户端未被调用")
 
 
 if __name__ == "__main__":
