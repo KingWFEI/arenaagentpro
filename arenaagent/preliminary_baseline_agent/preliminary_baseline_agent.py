@@ -37,10 +37,15 @@ class PreliminaryBaselineAgentCfg(VLMAgentCfg):
     counting_post_turn_settle_seconds: float = 0.12
     counting_capture_max_attempts: int = 3
     counting_image_max_width: int = 1280
+    counting_perception_width: int = 1280
+    counting_perception_height: int = 720
     counting_clock_closeups: int = 2
     counting_clock_image_max_width: int = 2000
     counting_max_recovery_submissions: int = 7
     counting_corner_move_distance: float = 80.0
+    counting_occlusion_clearance: float = 70.0
+    # Experimental corner start; the conservative spawn panorama is the scored default.
+    counting_use_corner_route: bool = False
 
 
 @Register("preliminary_baseline_agent")
