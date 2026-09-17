@@ -1252,7 +1252,10 @@ class CountingStrategy(TaskStrategy):
                 force_decision or final_available_call,
             )
             agent._save_prompt_messages(messages)
-            response = agent.vlm_client.invoke(messages, max_retries=1)
+            # A reasoning main model takes minutes per review call; prefer the
+            # dedicated fast reviewer when one is configured.
+            review_client = getattr(agent, "counting_review_client", None) or agent.vlm_client
+            response = review_client.invoke(messages, max_retries=1)
             self.model_calls += 1
             response_text = str(getattr(response, "text", ""))
             logger.debug("Counting review raw response {}: {}", self.model_calls, response_text[:2000])

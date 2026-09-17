@@ -14,6 +14,9 @@ from arenaagent.generated.arena.message import basic_type_pb2
 from arenaagent.preliminary_baseline_agent.task_registry import create_task_strategy, supported_task_types
 from arenaagent.preliminary_baseline_agent.task_runtime import TaskContext, normalize_task_type
 from arenaagent.preliminary_baseline_agent.tasks.base import TaskStrategy
+from arenaagent.preliminary_baseline_agent.tasks.counting.review_client import (
+    build_counting_review_client_from_env,
+)
 from arenaagent.preliminary_baseline_agent.tasks.counting.runtime import run_counting_subject
 from arenaagent.preliminary_baseline_agent.tasks.jigsaw.runner import run_dedicated_jigsaw
 from arenaagent.preliminary_baseline_agent.tasks.npc.runner import run_npc_fast_step
@@ -87,6 +90,8 @@ class PreliminaryBaselineAgent(VLMAgent):
         self._raven_text_client_initialized = False
         self.npc_text_client = None
         self._npc_text_client_initialized = False
+        self.counting_review_client = None
+        self._counting_review_client_initialized = False
         self._jigsaw_attempt_subject_key: tuple[str, str] | None = None
 
     def init(self, opt: dict[str, Any]) -> None:
@@ -281,6 +286,9 @@ class PreliminaryBaselineAgent(VLMAgent):
         if task_type == "npc" and not self._npc_text_client_initialized:
             self.npc_text_client = build_npc_text_client_from_env()
             self._npc_text_client_initialized = True
+        if task_type == "counting" and not self._counting_review_client_initialized:
+            self.counting_review_client = build_counting_review_client_from_env()
+            self._counting_review_client_initialized = True
         safe_subject = dict(subject) if isinstance(subject, dict) else {"subject": str(subject)}
         identity = str(
             safe_subject.get("subject_id")
