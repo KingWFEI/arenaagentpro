@@ -68,6 +68,25 @@ class CountingProtocolTests(unittest.TestCase):
 
         self.assertEqual(option, "B")
 
+    def test_recovery_does_not_rank_unsupported_zero_before_plus_one(self):
+        strategy = CountingStrategy()
+        subject = {
+            "question": "房间中有多少个苹果？",
+            "options": {"A": 12, "B": 13, "C": 14, "D": 1, "E": 4, "F": 0, "G": 5, "H": 6},
+        }
+        strategy.reset(subject)
+        strategy.memory.records = {
+            f"o{index}": CountingRecord(
+                f"o{index}", color="Red", shape="Round", size=(12, 12, 12)
+            )
+            for index in range(1, 5)
+        }
+
+        ranked = strategy.ranked_recovery_counts(subject, {4})
+
+        self.assertEqual(ranked[0], 5)
+        self.assertGreater(ranked.index(0), ranked.index(5))
+
     def test_competition_cup_prototype_excludes_larger_white_containers(self):
         red_cup = CountingRecord("cup", color="Red", shape="Cylinder", size=(7, 7, 8))
         white_container = CountingRecord(
@@ -278,6 +297,7 @@ class FakeAgent:
             counting_image_max_width=0,
             counting_move_distance=80,
             counting_max_model_calls=2,
+            counting_use_corner_route=False,
         )
         self.action_space = {"key": "answer"}
         self.events = []
@@ -353,6 +373,7 @@ class CountingFastPathTests(unittest.TestCase):
         agent = FakeAgent()
         agent._spawn_xy = (282.0, -353.0)
         agent._spawn_yaw = -90.0
+        agent.cfg.counting_use_corner_route = True
         agent.cfg.counting_corner_move_distance = 80.0
         strategy = CountingStrategy()
         subject = {
