@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from arenaagent.preliminary_baseline_agent.preliminary_baseline_agent import PreliminaryBaselineAgent
-from arenaagent.preliminary_baseline_agent.tasks.counting.perception import acquire_counting_perception
 from arenaagent.preliminary_baseline_agent.tasks.counting.runtime import run_counting_subject
 
 from arenaagent.preliminary_baseline_agent.tasks.counting.strategy import (
@@ -314,25 +313,6 @@ class FakeAgent:
 
 
 class CountingIntegrationTests(unittest.TestCase):
-    def test_atomic_perception_reads_image_and_objects_together(self):
-        service = Mock()
-        service.acquire_first_person_perception.return_value = {
-            "image": "encoded-image",
-            "objects": [{"object_id": "raw-1", "shape": "Bowl"}],
-        }
-        mapper = SimpleNamespace(last_perception_diagnostics={"old": True})
-        agent = SimpleNamespace(
-            tongsim=service,
-            semantic_mapper=mapper,
-            character_id="character",
-            cfg=SimpleNamespace(counting_perception_width=1280, counting_perception_height=720),
-        )
-        result = acquire_counting_perception(agent, {})
-        self.assertEqual(result[0], "encoded-image")
-        self.assertEqual(result[2][0]["object_id"], "raw-1")
-        service.acquire_first_person_perception.assert_called_once_with("character", width=1280, height=720)
-        self.assertEqual(mapper.last_perception_diagnostics, {})
-
     def test_integer_counting_output_does_not_change_other_tasks(self):
         agent = PreliminaryBaselineAgent(stub=None, channel=None)
         agent.action_space = {"key": "answer", "type": "int"}

@@ -14,7 +14,6 @@ from arenaagent.generated.arena.message import basic_type_pb2
 from arenaagent.preliminary_baseline_agent.task_registry import create_task_strategy, supported_task_types
 from arenaagent.preliminary_baseline_agent.task_runtime import TaskContext, normalize_task_type
 from arenaagent.preliminary_baseline_agent.tasks.base import TaskStrategy
-from arenaagent.preliminary_baseline_agent.tasks.counting.perception import acquire_counting_perception
 from arenaagent.preliminary_baseline_agent.tasks.counting.runtime import run_counting_subject
 from arenaagent.preliminary_baseline_agent.tasks.jigsaw.runner import run_dedicated_jigsaw
 from arenaagent.preliminary_baseline_agent.tasks.npc.runner import run_npc_fast_step
@@ -35,8 +34,6 @@ class PreliminaryBaselineAgentCfg(VLMAgentCfg):
     counting_post_turn_settle_seconds: float = 0.12
     counting_capture_max_attempts: int = 3
     counting_image_max_width: int = 1280
-    counting_perception_width: int = 1280
-    counting_perception_height: int = 720
     counting_clock_closeups: int = 2
     counting_clock_image_max_width: int = 2000
     counting_max_recovery_submissions: int = 7
@@ -350,10 +347,6 @@ class PreliminaryBaselineAgent(VLMAgent):
         **kwargs: Any,
     ) -> tuple[str | None, list[dict[str, Any]], list[dict[str, Any]]]:
         """转向后只接受分割区域与可见对象映射基本一致的完整感知。"""
-        if normalize_task_type(subject) == "counting":
-            unified = acquire_counting_perception(self, kwargs)
-            if unified is not None:
-                return unified
         is_post_turn_full_capture = bool(
             normalize_task_type(subject) == "tidyroom"
             and self._last_executed_action_name == "turn_in_degree"
