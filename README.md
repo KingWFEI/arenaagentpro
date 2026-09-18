@@ -36,9 +36,13 @@ Copy-Item .env.example .env
 Copy-Item config.toml.example config.toml
 uv sync
 uv run scripts/generate_pb2.py
+uv sync --reinstall-package arenaagentpro
 ```
 
-**最后一步不能省。** `arenaagent/generated/` 下的 protobuf 接口文件由脚本生成、不入库（`.gitignore` 里的 `**/generated/`），缺了它连 `import arenaagent` 都会失败，报 `No module named 'arenaagent.generated'`。
+**后两步不能省。**
+
+- `arenaagent/generated/` 下的 protobuf 接口文件由脚本生成、不入库（`.gitignore` 的 `**/generated/`）。缺了它连 `import arenaagent` 都会失败，报 `No module named 'arenaagent.generated'`。
+- 生成出来的 `arena/`、`tongsim/` 是**顶层包**（`pyproject.toml` 把 `arenaagent/generated` 配成了包发现根目录），而 editable 安装只在 `uv sync` 那一刻扫描一次目录。所以生成之后必须重装一次本项目，否则 `uv run arenaagent` 会报 `No module named 'arena'`。
 
 随后填写 `.env` 中的模型地址和密钥。`.env` 与 `config.toml` 已加入忽略规则，不会被提交到 GitHub。
 
