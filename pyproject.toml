@@ -42,8 +42,10 @@ dependencies = [
 [project.scripts]
 arenaagent = "arenaagent.builder:main"
 
-[project.optional-dependencies]
-dev = ["ruff", "flake8", "pylint", "Flake8-pyproject", "pre-commit", "black"]
+# 用 PEP 735 的依赖组而不是 optional-dependencies：uv sync 默认安装依赖组，
+# 写成 extra 的话新克隆要额外加 --extra dev 才有 pytest。
+[dependency-groups]
+dev = ["pytest", "ruff", "flake8", "pylint", "Flake8-pyproject", "pre-commit", "black"]
 
 [[tool.uv.index]]
 name = "tuna"

@@ -35,9 +35,14 @@
 Copy-Item .env.example .env
 Copy-Item config.toml.example config.toml
 uv sync
+uv run scripts/generate_pb2.py
 ```
 
+**最后一步不能省。** `arenaagent/generated/` 下的 protobuf 接口文件由脚本生成、不入库（`.gitignore` 里的 `**/generated/`），缺了它连 `import arenaagent` 都会失败，报 `No module named 'arenaagent.generated'`。
+
 随后填写 `.env` 中的模型地址和密钥。`.env` 与 `config.toml` 已加入忽略规则，不会被提交到 GitHub。
+
+自测：`uv run pytest tests/ -q`。
 
 ### 启动顺序
 
