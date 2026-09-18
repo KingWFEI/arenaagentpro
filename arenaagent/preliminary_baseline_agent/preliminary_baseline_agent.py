@@ -48,7 +48,7 @@ class PreliminaryBaselineAgent(VLMAgent):
     """Shared VLM runtime with isolated strategy state for each preliminary task."""
 
     _TIDYROOM_MAX_LOCAL_STEPS = 64
-    _NPC_MAX_LOCAL_STEPS = 6
+    _NPC_MAX_LOCAL_STEPS = 8
     _TIDYROOM_POST_TURN_SETTLE_SECONDS = 0.25
     _TIDYROOM_POST_TURN_MAX_ATTEMPTS = 5
     _TIDYROOM_SEGMENTATION_GAP_RATIO = 0.20
@@ -155,8 +155,9 @@ class PreliminaryBaselineAgent(VLMAgent):
 
         # 所有物品均已在提交前完成几何校验，可以立即通知赛题端评估。
         self._evaluate_subject()
+
     def _run_npc_subject_fast(
-        self, 
+        self,
         subject: dict[str, Any],
     ) -> None:
         """在单个本地循环中完成四名 NPC 访谈和最终文本判断。"""
@@ -164,6 +165,7 @@ class PreliminaryBaselineAgent(VLMAgent):
         self.subject_finished = False
 
         final_actions = {"submit_answer", "finish_task"}
+        accepted_final_answer = False
 
         logger.info(
             "Using NPC fast loop (max_steps={})",
@@ -182,10 +184,23 @@ class PreliminaryBaselineAgent(VLMAgent):
                 action_name,
             )
 
-                    # 最终答案只在这里向 Arena 上报一次。
+            # 最终答案只在这里向 Arena 上报一次。
             if action_name in final_actions:
-                self._apply_action(action_result)
+                apply_response = self._apply_action(action_result)
+                if apply_response.get("answer_right") is False:
+                    answer_key = str(getattr(self, "action_space", {}).get("key") or "answer")
+                    rejected_answer = str(action_result.get(answer_key) or "").strip()
+                    strategy = self._task_strategy
+                    if isinstance(strategy, NpcStrategy):
+                        strategy.note_rejected_answer(rejected_answer)
+                    self.subject_finished = False
+                    logger.warning(
+                        "NPC answer '{}' was rejected by Arena; retrying with remaining candidates",
+                        rejected_answer,
+                    )
+                    continue
                 self.subject_finished = True
+                accepted_final_answer = True
                 logger.info(
                     "NPC fast loop finished with final action {}",
                     action_name,
@@ -211,7 +226,10 @@ class PreliminaryBaselineAgent(VLMAgent):
                 self._NPC_MAX_LOCAL_STEPS,
             )
 
-        self._evaluate_subject()
+        if accepted_final_answer:
+            self._evaluate_subject()
+        else:
+            logger.error("NPC fast loop ended without an answer accepted by Arena")
 
     def _run_raven_subject_safely(self, first_subject: dict[str, Any]) -> None:
         """Discard a slow answer if the server moved to the next Raven subject.
@@ -273,9 +291,6 @@ class PreliminaryBaselineAgent(VLMAgent):
         if task_type == "raven" and not self._raven_text_client_initialized:
             self.raven_text_client = build_raven_text_client_from_env()
             self._raven_text_client_initialized = True
-        if task_type == "npc" and not self._npc_text_client_initialized:
-            self.npc_text_client = build_npc_text_client_from_env()
-            self._npc_text_client_initialized = True
         safe_subject = dict(subject) if isinstance(subject, dict) else {"subject": str(subject)}
         identity = str(
             safe_subject.get("subject_id")

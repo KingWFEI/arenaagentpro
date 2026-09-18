@@ -7,7 +7,9 @@ from loguru import logger
 from arenaagent.preliminary_baseline_agent.task_runtime import TaskContext
 from arenaagent.preliminary_baseline_agent.tasks.npc.strategy import NpcStrategy
 from arenaagent.vlm_agent.json_parsor import extract_last_json_from_text
-
+from arenaagent.preliminary_baseline_agent.tasks.npc.text_client import (
+    build_npc_text_client_from_env,
+)
 
 def run_npc_fast_step(
     agent: Any,
@@ -39,7 +41,16 @@ def run_npc_fast_step(
 
     messages = strategy.decision_messages()
     agent._save_prompt_messages(messages)
-    text_client = getattr(agent, "npc_text_client", None) or agent.vlm_client
+    text_client = getattr(agent, "npc_text_client", None)
+
+    if text_client is None:
+        text_client = build_npc_text_client_from_env()
+        agent.npc_text_client = text_client
+        agent._npc_text_client_initialized = text_client is not None
+
+    if text_client is None:
+        text_client = agent.vlm_client
+
     response = text_client.invoke(messages) if text_client else None
     response_text = getattr(response, "text", None) or ""
     parsed = extract_last_json_from_text(response_text)

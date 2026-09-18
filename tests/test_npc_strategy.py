@@ -123,6 +123,80 @@ class NpcStrategyTests(unittest.TestCase):
         )
         self.assertNotIn("think", state)
 
+    def test_rejected_answer_is_retried_locally_with_next_candidate(self) -> None:
+        for name in self.subject["options"]:
+            self.record_reply(name, f"{name}的证言")
+        self.strategy.note_rejected_answer("张奶奶")
+
+        action = self.strategy.next_local_action(self.context())
+
+        self.assertIsNotNone(action)
+        self.assertEqual("submit_answer", action["action"])
+        self.assertEqual("江淑艳", action["output"])
+
+    def test_decision_prompt_does_not_treat_missing_observation_as_an_alibi(self) -> None:
+        messages = self.strategy.decision_messages()
+
+        self.assertIn("没看见某人拿钥匙", messages[0]["content"])
+        self.assertIn("不能证明其没有作案", messages[0]["content"])
+
+    def test_local_verdict_handles_recurring_high_confidence_patterns(self) -> None:
+        cases = (
+            (
+                "刘伟东",
+                {
+                    "江淑艳": "刘伟东在撒谎。今天上午外面一直在下大雨。",
+                    "刘伟东": "我整个上午都在外面的花园里散步。",
+                    "赵爷爷": "我的老花镜早上落在二楼卧室了。",
+                    "张奶奶": "我看到刘伟东神色慌张地从书房里溜出来。",
+                },
+            ),
+            (
+                "江淑艳",
+                {
+                    "江淑艳": "赵爷爷一直在靠椅上睡觉，他什么都没看见。",
+                    "刘伟东": "我看到江淑艳把果盘底下的钥匙顺走了。",
+                    "赵爷爷": "我根本没睡觉！",
+                    "张奶奶": "赵爷爷说的是实话，他根本没睡着。",
+                },
+            ),
+            (
+                "刘伟东",
+                {
+                    "江淑艳": "我没看到赵爷爷碰过钥匙。",
+                    "刘伟东": "赵爷爷拿的，我看见他把红绳塞进包侧袋。",
+                    "赵爷爷": "刘伟东走到放钥匙的桌子旁停了一下。",
+                    "张奶奶": "我亲眼看见刘伟东在放钥匙的书桌边蹲了下去。",
+                },
+            ),
+            (
+                "江淑艳",
+                {
+                    "江淑艳": "钥匙不见后我第一时间看了下桌面和抽屉，确定不是我拿错了。张奶奶拿了钥匙。",
+                    "刘伟东": "我当时就在工位附近，江淑艳说的是真的，她没有拿钥匙。",
+                    "赵爷爷": "我也能作证。江淑艳说的是真的，我也没见过江淑艳拿钥匙。",
+                    "张奶奶": "我没拿钥匙。肯定是江淑艳拿的，她刚才最靠近钥匙柜，还在那边停了几秒。",
+                },
+            ),
+        )
+
+        for expected, replies in cases:
+            with self.subTest(expected=expected):
+                strategy = NpcStrategy()
+                strategy.reset(self.subject)
+                for name, reply in replies.items():
+                    strategy.after_action(
+                        self.dialogue_action(name),
+                        {"npc_name": name, "npc_reply": reply},
+                        self.context(),
+                    )
+
+                action = strategy.next_local_action(self.context())
+
+                self.assertIsNotNone(action)
+                self.assertEqual("submit_answer", action["action"])
+                self.assertEqual(expected, action["output"])
+
     def test_invalid_final_candidate_is_not_submitted(self) -> None:
         for name in self.subject["options"]:
             self.record_reply(name, f"{name}的证言")
