@@ -27,6 +27,9 @@ class TidyRoomStrategy(TaskStrategy):
     # 角色移动后的观察会持续并入世界模型，不必再次原地转完整一圈。
     _MAX_LOCAL_SEARCH_TURNS = 4
     _LOCAL_SEARCH_DEGREES = 45
+    # 目的地在这局房间里根本不存在时（模型把物品认成"鞋子"但屋里没有鞋架），
+    # 转满几轮就该放弃这类目标，否则会把整道题的时间全耗在转圈上。
+    _MAX_MISSING_DESTINATION_ROUNDS = 2
     _TRASH_SETTLE_OBSERVATIONS = 1
     _MAX_OFFICIAL_CONTAINER_ATTEMPTS = 2
     _MAX_PLACEMENT_VERIFICATION_FAILURES = 3
@@ -57,6 +60,7 @@ class TidyRoomStrategy(TaskStrategy):
         self.local_search_turns = 0
         self.local_search_reason: str | None = None
         self.local_search_signature: tuple[Any, ...] | None = None
+        self._missing_destination_rounds: dict[str, int] = {}
         self.successful_takes = 0
         self.successful_puts = 0
         self.failed_actions = 0
@@ -66,6 +70,23 @@ class TidyRoomStrategy(TaskStrategy):
         self.vlm_call_count = 0
         self.vlm_reason: str | None = None
         self._second_frame_vlm_pending = False
+        self._survey_done = False
+
+    def survey_is_due(self) -> bool:
+        """扫完一圈、手里还没有任何目标时，做一次全屋多图标注。
+
+        912 不下发目标清单，逐帧问模型会得到互相矛盾的标签；这里在勘测结束时
+        一次性问全，之后执行阶段不再需要模型。
+        """
+        return bool(
+            not self.world.targets_declared_by_task
+            and self.scanner.complete
+            and not self.world.targets
+            and not self._survey_done
+        )
+
+    def note_survey_attempted(self) -> None:
+        self._survey_done = True
 
     def observe(self, context: TaskContext) -> None:
         super().observe(context)
@@ -120,11 +141,20 @@ class TidyRoomStrategy(TaskStrategy):
         self._request_vlm(reason)
 
     def should_force_second_frame_vlm(self) -> bool:
-        """首帧未形成组合并转向后，第二帧必须完整采集并咨询一次 VLM。"""
+        """首帧未形成组合并转向后，第二帧必须完整采集并咨询一次 VLM。
+
+        前提是任务系统已经下发了目标清单——模型可以拿清单去比对自己看到的
+        画面。912 不再下发清单，此时扫描才刚开始，模型没有可对照的物品，问
+        它只会得到"继续转"这类无用回答（实测单次 70~130 秒）。这种情况留给
+        扫描覆盖全屋之后的 local_plan_unavailable 一次性补充语义。
+        """
         return bool(
             self._second_frame_vlm_pending
             and self.step_index >= 2
             and self.vlm_call_count == 0
+            # 必须是任务系统下发的清单；勘测发现的目标不算，否则全屋标注之后
+            # 又会被这个条件触发一次多余的诊断。
+            and self.world.targets_declared_by_task
         )
 
     def next_local_action(self, context: TaskContext) -> dict[str, Any] | None:
@@ -190,14 +220,24 @@ class TidyRoomStrategy(TaskStrategy):
             search_action = self._next_local_search_action(self.vlm_reason)
             if search_action is not None:
                 return self._count_local(search_action)
+            # 刚放弃了一批够不着的目标，别再为它们问一次模型。
+            if self._all_targets_settled():
+                return self._count_local(self._submit_action())
         return self._request_vlm(self.vlm_reason or "local_plan_unavailable")
+
+    def _all_targets_settled(self) -> bool:
+        return bool(
+            self.targets
+            and (self.world.targets_declared_by_task or self.scanner.complete)
+            and all(record.get("status") in {"done", "blocked"} for record in self.targets.values())
+        )
 
     def _next_active_action(self) -> dict[str, Any] | None:
         """继续已开始的确定性搬运链，不被其他缺失目标打断。"""
 
-        if self.targets and all(
-            record.get("status") in {"done", "blocked"} for record in self.targets.values()
-        ):
+        # 任务系统下发了完整清单时，清单做完即可提交。清单是模型逐帧发现的
+        # 时候（912）不行：扫描没走完就可能还有一侧的房间压根没看过。
+        if self._all_targets_settled():
             return self._count_local(self._submit_action())
 
         if self.awaiting_verification_raw_id is not None:
@@ -241,6 +281,12 @@ class TidyRoomStrategy(TaskStrategy):
         parameters = action.get("parameters") or {}
         consulted_reason = self.vlm_reason
         self.world.apply_semantic_hints(parameters, context)
+        # 模型顺带标注的其余物品与家具也一并收下，避免为每一件再往返一次。
+        # 它有时写在 parameters 里，有时写在动作顶层，两处都收。
+        self.world.apply_scene_annotations(
+            parameters.get("scene_annotations") or action.get("scene_annotations"),
+            context,
+        )
         requested_id = str(parameters.get("object_id") or "")
         self.recovery.mark_vlm_consulted(self._active_raw_id())
         self.vlm_reason = None
@@ -594,8 +640,12 @@ class TidyRoomStrategy(TaskStrategy):
         )
 
     def _scan_requirements_met(self) -> bool:
-        """五个目标及它们实际需要的家具均已进入持续世界模型。"""
+        """目标及它们实际需要的家具均已进入持续世界模型。"""
         if not self.targets:
+            return False
+        if not self.world.targets_declared_by_task:
+            # 912 不下发清单，模型标注的只是它那一帧看到的部分。提前结束扫描
+            # 会让房间另一侧的物品永远进不了世界模型，必须扫完整圈。
             return False
         if any(record.get("object_id") is None for record in self.targets.values()):
             return False
@@ -664,11 +714,39 @@ class TidyRoomStrategy(TaskStrategy):
             # 原地发现新对象只更新搜索原因，不重置补扫预算。只有成功抓取
             # 带来真实位置变化后，_reset_local_search 才开始新一轮搜索。
         if self.local_search_turns >= self._MAX_LOCAL_SEARCH_TURNS:
+            if reason.startswith("missing_destination:"):
+                self._give_up_on_destination(reason)
             return None
         return self._turn_action(
             self._LOCAL_SEARCH_DEGREES,
             f"本地补充搜索 {self.local_search_turns + 1}/{self._MAX_LOCAL_SEARCH_TURNS}：{reason}。",
         )
+
+    def _give_up_on_destination(self, reason: str) -> None:
+        """目的地在这局房间里不存在时，把需要它的目标标成 blocked。
+
+        模型会把物品认成"鞋子"，而屋里根本没有鞋架。不设上限的话就是：转满
+        4 圈 → 问模型 → validate_action 重置预算 → 再转 4 圈，整道题的时间
+        全耗在转圈上。转满若干轮就放弃这类目标，让调度器去做别的或者提交。
+        """
+        destination_type = reason.partition(":")[2]
+        rounds = self._missing_destination_rounds.get(destination_type, 0) + 1
+        self._missing_destination_rounds[destination_type] = rounds
+        if rounds < self._MAX_MISSING_DESTINATION_ROUNDS:
+            return
+        blocked = 0
+        for record in self.targets.values():
+            if record.get("status") in {"done", "blocked"}:
+                continue
+            if self.world.destination_type_for(record) == destination_type:
+                record["status"] = "blocked"
+                blocked += 1
+        if blocked:
+            logger.warning(
+                "Tidy-room gave up on {} target(s) needing {}: no such destination is visible in this room",
+                blocked,
+                destination_type,
+            )
 
     def _local_search_signature(self, reason: str) -> tuple[Any, ...]:
         mapped_targets = sum(record.get("object_id") is not None for record in self.targets.values())

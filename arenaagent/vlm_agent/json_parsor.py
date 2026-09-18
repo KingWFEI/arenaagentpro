@@ -70,11 +70,46 @@ def fix_structural_dicts_only(text):
     return fixed
 
 
+def balanced_spans(text: str, opener: str, closer: str) -> list[str]:
+    """扫描出所有括号配对的片段，跳过字符串字面量内部的括号。
+
+    不能用 r"\\[\\s*{.*?}\\s*\\]" 这类懒惰正则：回答里只要出现"对象里再套一个
+    数组"（例如 scene_annotations），它就会在内层数组的 ] 处提前收尾，截出的
+    片段缺少外层的 } 和 ]，解析必然失败。
+    """
+    spans: list[str] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == opener:
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == closer and depth > 0:
+            depth -= 1
+            if depth == 0:
+                spans.append(text[start : index + 1])
+                start = -1
+    return spans
+
+
 def extract_last_json_from_text(text):
     """
     提取最后一个 JSON 片段（数组或对象）。
     - 若整体就是合法 JSON，直接解析。
-    - 否则，用正则抓取最后一个 [ {...} ] 片段并解析。
+    - 否则按括号配对扫描候选片段，从后往前取第一个能解析的。
     """
     stripped = (text or "").strip()
     if stripped.startswith(("[", "{")):
@@ -83,7 +118,6 @@ def extract_last_json_from_text(text):
         except Exception:
             pass
 
-    json_pattern = r"\[\s*{.*?}\s*\]"
     try:
         text = text.replace("True", "true").replace("False", "false").replace("None", "null")
         # 处理常见中文符号
@@ -104,13 +138,17 @@ def extract_last_json_from_text(text):
             .replace("！", "!")
         )
 
-        matches = re.findall(json_pattern, text, re.DOTALL)
-        if not matches:
-            print("未找到符合条件的JSON数据")
-            return "未找到符合条件的JSON数据"
-
-        json_str = fix_structural_dicts_only(matches[-1])
-        return json.loads(json_str)
+        # 数组优先（回答约定是长度为 1 的数组），再退回到裸对象；各自从后往前，
+        # 最后一段才是本次回答。顺序不能颠倒，否则会先命中数组里的某个内层对象。
+        candidates = list(reversed(balanced_spans(text, "[", "]")))
+        candidates += list(reversed(balanced_spans(text, "{", "}")))
+        for candidate in candidates:
+            try:
+                return json.loads(fix_structural_dicts_only(candidate))
+            except json.JSONDecodeError:
+                continue
+        print("未找到符合条件的JSON数据")
+        return "未找到符合条件的JSON数据"
     except json.JSONDecodeError as e:
         print(f"JSON解析错误: {e}")
         return f"JSON解析错误: {e}"

@@ -97,6 +97,26 @@ class TongSimInterface(ABC):
         """
         raise NotImplementedError()
 
+    # 以下能力只在较新的服务端上存在。默认实现抛 NotImplementedError，调用方
+    # 捕获后回退到上面的旧接口，从而同时兼容新旧两版仿真服务端。
+    def acquire_first_person_perception(
+        self, character_id, width: int | None = None, height: int | None = None
+    ) -> dict[str, Any] | None:
+        """信息：一次调用同时取回画面与可见物体详情，返回 None 表示服务端不支持。"""
+        raise NotImplementedError()
+
+    def has_object_in_hand(self, character_id) -> tuple[bool, int | None] | None:
+        """信息：手里是否拿着东西及哪只手，返回 None 表示服务端不支持。"""
+        raise NotImplementedError()
+
+    def move_to_npc(self, character_id, npc_name: str) -> dict[str, Any] | None:
+        """动作：按 NPC 资产名走过去，返回 None 表示服务端不支持。"""
+        raise NotImplementedError()
+
+    def transfer_puzzle_piece(self, character_id, piece_object_id: str, which_hand: int = 0):
+        """动作：拼图专用拿取动作。"""
+        raise NotImplementedError()
+
     # 动作接口（按 api_info.json 定义，保留兼容旧接口）
     @abstractmethod
     def look_at_location(

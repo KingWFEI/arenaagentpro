@@ -85,6 +85,26 @@ class SemanticMapper:
         """通过映射后的 ID 找回 tongsim sdk 中的原始 visible object id。"""
         return self.rev_object_id_map.get(mapped_id)
 
+    def register_identity_ids(self, object_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把服务端原始 ID 直接登记为映射 ID（映射退化为恒等）。
+
+        较新的服务端自己绘制分割图，图上的数字就是原始 ID，而提示词要求模型
+        "只能使用分割图中的数字 ID"。若这里压缩成 1..N，模型从图上读到的数字
+        会被再翻译一次，指向另一个物体。
+        """
+        mapped = []
+        for obj in object_list:
+            raw_id = str(obj["object_id"])
+            try:
+                identity = int(raw_id)
+            except ValueError:
+                # 非数字 ID（旧服务端的实例名）与分割图数字无法对应，顺延编号。
+                identity = len(self.rev_object_id_map) + 1
+            self.object_id_map[raw_id] = identity
+            self.rev_object_id_map[identity] = raw_id
+            mapped.append({"object_id": identity, "segmentation_id": None})
+        return mapped
+
     def get_mapped_id(self, raw_id: str) -> int | None:
         """通过 tongsim sdk 中的原始 visible object id 找回映射后的 ID。"""
         return self.object_id_map.get(raw_id)
@@ -161,7 +181,7 @@ class SemanticMapper:
                 return None
         return None
 
-    def get_perception_from_camera(  # noqa: PLR0912, PLR0915
+    def get_perception_from_camera(
         self,
         is_save: bool = False,
         log_dir: str | None = None,
@@ -175,10 +195,105 @@ class SemanticMapper:
         通过 TongSimInterface 获取感知结果：左侧 RGB，右侧 ID 伪彩色图，组合后以 base64(JPEG) 返回。
         同时返回当前可见物体的映射列表（含 segmentation_id）以及可见物体基础信息（颜色/形状/放置位置）。
         若 is_save=True，会将拼接后的图片保存到 log_dir（默认使用 AgentCfg.log_dir 或 logs）。
+
+        较新的服务端提供一次性原子感知，已经拼好带标签的画面并附带全部物体详情，
+        此时直接采用；旧服务端返回 None，退回下面的分步采集。
         """
         if self.tongsim is None or self.character_id is None:
             return None, [], []
 
+        unified = self._acquire_unified_perception()
+        if unified is not None:
+            return self._perception_from_unified(
+                unified,
+                is_save=is_save,
+                log_dir=log_dir,
+                include_images=include_images,
+                include_object_details=include_object_details,
+                save_label=save_label,
+            )
+        return self._perception_from_split(
+            is_save=is_save,
+            log_dir=log_dir,
+            include_images=include_images,
+            include_object_details=include_object_details,
+            use_cached_details=use_cached_details,
+            save_label=save_label,
+        )
+
+    def _acquire_unified_perception(self) -> dict[str, Any] | None:
+        """调用较新的统一感知接口；服务端不支持时返回 None。"""
+        acquire = getattr(self.tongsim, "acquire_first_person_perception", None)
+        if acquire is None:
+            return None
+        try:
+            return acquire(self.character_id)
+        except NotImplementedError:
+            return None
+
+    def _perception_from_unified(  # noqa: PLR0913
+        self,
+        perception: dict[str, Any],
+        *,
+        is_save: bool,
+        log_dir: str | None,
+        include_images: bool,
+        include_object_details: bool,
+        save_label: str | None,
+    ) -> tuple[str | None, list[dict[str, Any]], list[dict[str, Any]]]:
+        """把统一感知的响应整理成与分步采集一致的返回值。
+
+        服务端保证画面与物体列表同帧，并且自己完成了 ID 标注与拼接，因此这里不再
+        计算像素覆盖率。last_perception_diagnostics 留空，依赖它的两个一致性检查
+        会以 diagnostics_unavailable 放行，正好对应"服务端已保证同步"。
+        """
+        raw_objects = [
+            item
+            for item in (perception.get("objects") or [])
+            if isinstance(item, dict) and item.get("object_id") is not None
+        ]
+        visible_objects = self.register_identity_ids(raw_objects)
+        self.last_perception_diagnostics = {}
+
+        visible_objects_info: list[dict[str, Any]] = []
+        if include_object_details:
+            for obj, mapped in zip(raw_objects, visible_objects, strict=True):
+                info = {
+                    "object_id": str(mapped["object_id"]),
+                    "color": obj.get("color") or "Unknown",
+                    "shape": obj.get("shape") or "Unknown",
+                    "place_location": obj.get("place_location") or {},
+                    "world_aabb": obj.get("world_aabb"),
+                }
+                visible_objects_info.append(info)
+                self._object_details_cache[str(obj["object_id"])] = deepcopy(info)
+
+        if not include_images:
+            return None, visible_objects, visible_objects_info
+
+        image_b64 = perception.get("image")
+        if not image_b64:
+            logger.warning("unified perception returned no image: {}", perception.get("error"))
+            return None, visible_objects, visible_objects_info
+
+        if is_save:
+            decoded = self._decode_image(image_b64)
+            if decoded is not None:
+                self._save_image(decoded, log_dir=log_dir, save_label=save_label)
+
+        return image_b64, visible_objects, visible_objects_info
+
+    def _perception_from_split(  # noqa: PLR0912, PLR0913, PLR0915
+        self,
+        *,
+        is_save: bool,
+        log_dir: str | None,
+        include_images: bool,
+        include_object_details: bool,
+        use_cached_details: bool,
+        save_label: str | None,
+    ) -> tuple[str | None, list[dict[str, Any]], list[dict[str, Any]]]:
+        """分步采集：分别取 RGB、分割图和可见物体，再在本地对齐并拼接。"""
         buffer_rgb = None
         buffer_seg = None
         if include_images:

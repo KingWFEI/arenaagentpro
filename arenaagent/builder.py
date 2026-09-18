@@ -200,6 +200,16 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run_times", default=1, help="Number of times to run the agent.")
     return parser.parse_args(argv)
 
+def _release_agent_quietly(agent) -> None:
+    """run() 中途抛错时走不到 _disconnect，这里补一次角色回收。"""
+    if agent is None:
+        return
+    try:
+        agent.deinit()
+    except Exception as exc:  # pragma: no cover - 尽力而为的清理
+        logger.warning("cleanup after failure failed: {}", exc)
+
+
 def main() -> None:
     args = _parse_args()
     load_project_environment()
@@ -253,12 +263,14 @@ def main() -> None:
         channel = _create_channel(grpc_target)
         stub = TongTestAgentServiceStub(channel)
         time.sleep(2)  # 等待连接稳定
+        agent = None
         try:
             agent = builder.build(args.agent_name, stub=stub, channel=channel)
             agent.load(params)
             agent.run()
         except Exception as e:
             logger.opt(exception=True).warning("error trace back {}", e)
+            _release_agent_quietly(agent)
             continue
         finally:
             logger.info("Closing gRPC channel")

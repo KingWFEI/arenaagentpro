@@ -532,7 +532,12 @@ class TaskRuntimeTests(unittest.TestCase):
         agent.semantic_mapper = SecondFrameMapper()
         agent.prompt_generator = CapturingPromptGenerator()
         agent.vlm_client = OneInvokeClient()
-        subject = {"task_type": "tidyroom", "subject": "整理房间"}
+        # 旧服务端会下发目标清单；只有拿得到清单，第二帧诊断才有可比对的物品。
+        subject = {
+            "task_type": "tidyroom",
+            "subject": "整理房间",
+            "movable_object_id": ["BP_Pillow_10_TEST"],
+        }
 
         first_result = agent.run_step(subject, {})
         second_result = agent.run_step(subject, {})
@@ -553,6 +558,47 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(agent.vlm_client.calls, 1)
         self.assertEqual(agent._task_strategy.vlm_call_count, 1)
         self.assertFalse(agent._task_strategy._second_frame_vlm_pending)
+        self.assertEqual(agent._task_strategy.scanner.turns_completed, 2)
+
+    def test_tidyroom_without_a_target_list_skips_the_second_frame_vlm(self) -> None:
+        """912 不下发清单时，第二帧问模型只会得到"继续转"，白白花掉一分多钟。"""
+
+        class QuietMapper:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+                self.object_id_map = {}
+
+            def get_perception_from_camera(self, **kwargs):
+                self.calls.append(dict(kwargs))
+                return None, [], []
+
+        class CountingClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def invoke(self, messages):
+                del messages
+                self.calls += 1
+                return type("FakeResponse", (), {"text": "[]", "token_usage": None})()
+
+        class QuietAgent(PreliminaryBaselineAgent):
+            def _do_action(self, action):
+                return {"result": "success", "action": action["action"]}
+
+        agent = QuietAgent(stub=None, channel=None)
+        agent._initialized = True
+        agent.semantic_mapper = QuietMapper()
+        agent.vlm_client = CountingClient()
+
+        first_result = agent.run_step({"task_type": "tidyroom", "subject": "整理房间"}, {})
+        second_result = agent.run_step({"task_type": "tidyroom", "subject": "整理房间"}, {})
+
+        self.assertEqual(first_result["action"], "turn_in_degree")
+        self.assertEqual(second_result["action"], "turn_in_degree")
+        self.assertEqual(agent.vlm_client.calls, 0)
+        self.assertEqual(agent._task_strategy.vlm_call_count, 0)
+        # 清单缺失时不再消耗这次诊断，但标记保持不变，等扫描完再一次性补充语义。
+        self.assertTrue(agent._task_strategy._second_frame_vlm_pending)
         self.assertEqual(agent._task_strategy.scanner.turns_completed, 2)
 
     def test_tidyroom_fast_loop_caches_task_service_data(self) -> None:

@@ -4,6 +4,63 @@
 默认地址：`127.0.0.1:50060`  
 配置字段：`tongsim_server_endpoint`
 
+## 912 赛题系统实测接口
+
+对运行中的 912 服务端逐个调用 43 个候选方法得到的结果。**proto 声明不可信**：仓库里
+的 `tongsim_service.proto` 与 912 双向不一致——它声明了 912 没有的 `get_object_in_hand`，
+又漏掉了 912 有的 `has_object_in_hand`、`put_down_sth`、`move_to_npc`、`open_door`、
+`close_door`、`interact`。判断接口是否存在只能实际调用一次，看是否返回 `UNIMPLEMENTED`。
+
+复现：`uv run python scripts/probe_912_rpcs.py`（需 UE 客户端与 tongsim_server 同时在跑）
+
+### 912 提供
+
+| 分类 | 接口 |
+|---|---|
+| 感知 | `acquire_first_person_perception` |
+| 查看 | `look_at_location`、`look_at_object`、`point_at_object` |
+| 移动 | `move_to_location`、`move_forward`、`move_to_object`、`move_to_npc` |
+| 抓取 | `move_and_take_object`、`transfer_puzzle_piece`、`set_pickup_whitelist` |
+| 放置 | `put_down_sth`、`move_and_put_down`、`move_and_put_down_object_in_container` |
+| 手持 | `has_object_in_hand` |
+| 场景交互 | `pour_water`、`slice_food`、`wash_hands`、`wash_object_in_hand`、`sit_down_to_object`、`mop_floor`、`rest`、`open_door`、`close_door`、`interact` |
+| 对话 | `speak_to_npc` |
+| 生命周期 | `spawn_character`、`destory_character`、`close`、`heartbeat` |
+
+### 912 已删除
+
+`acquire_first_person_image`、`acquire_first_person_segmantic_image`、
+`fetch_first_person_visible_objects`、`get_object_basic_info`、`get_object_world_aabb`、
+`get_object_id_by_name`、`get_object_in_hand`、`put_down_to_location`、`set_object_pose`、
+`move_and_take_puzzle_piece`。
+
+### 统一感知的响应结构
+
+`acquire_first_person_perception(character_id, width, height)` 返回：
+
+- `image`：**服务端已经拼好的合成图**，左半 RGB、右半带数字标签的分割图，数字即 `object_id`。
+  对齐与标注都在服务端完成，客户端不再自己拼图。
+- `objects`：可见物体列表，每项含 `object_id`、`shape`、`color`、`place_location`、
+  `rotation`、`world_aabb`，**但没有 `segmentation_id`**。
+
+两个后果：旧的五个感知接口全部折叠进这一个调用；画面与物体列表由服务端保证同帧，
+本地无法再计算像素覆盖率，`last_perception_diagnostics` 留空，依赖它的两个一致性检查
+会以 `diagnostics_unavailable` 放行。
+
+## 新旧服务端兼容策略
+
+`TongSimGrpcClient` 对两版服务端都可用：
+
+- 新接口用 `channel.unary_unary(完整方法路径)` 直接拨号，绕开过期的 proto；只有旧版
+  才有的方法反过来沿用生成的 stub。
+- 服务端返回 `UNIMPLEMENTED` 时客户端返回 `None`（`acquire_first_person_perception`、
+  `has_object_in_hand`、`move_to_npc`），调用方据此回退到旧接口。`SemanticMapper` 的
+  两条路径分别是 `_perception_from_unified` 与 `_perception_from_split`。
+- 912 没有按物体查询 AABB 的接口，`get_object_world_aabb` 改用最近一次统一感知的缓存；
+  物体不在视野内时返回 `{}`，调用方保留此前缓存的包围盒。
+- 912 的 `has_object_in_hand` 只回答"手里有没有东西"，不回答是什么。抓取是获得物体的
+  唯一途径，因此 `VLMAgent` 记住最近一次抓取目标来还原手中物体 ID。
+
 ## 角色生命周期
 
 | 接口 | 参数 | 返回 | 说明 |

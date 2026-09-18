@@ -77,6 +77,9 @@ class VLMAgent(AgentBase):
         self._last_action_res: Any = {}
         self._last_apply_resp: dict[str, Any] = {}
         self._handled_piece_transfers: set[str] = set()
+        # 较新服务端只回答"手里有没有东西"，不回答是什么。抓取是唯一获取途径，
+        # 因此记住最近一次抓取目标即可还原手中物体。
+        self._last_pick_raw_id: str | None = None
         self._npc_name_to_asset_name: dict[str, str] = {}
         self._task_spec_prompt_cache: dict[str, str] | None = None
         self._movable_objects: list[Any] = []
@@ -119,6 +122,13 @@ class VLMAgent(AgentBase):
         if not self._initialized:
             return
         if self.tongsim:
+            if self.character_id:
+                # 只关通道不会回收角色。仿真端每个角色都带一个相机渲染目标，
+                # 泄漏的角色会一直占着显存，反复运行会不断累积。
+                try:
+                    self.tongsim.destory_character(self.character_id)
+                except Exception as exc:
+                    logger.warning("Failed to destroy character {}: {}", self.character_id, exc)
             try:
                 self.tongsim.close()
                 logger.info("Released TongSim resources for character {}", self.character_id)
@@ -211,7 +221,7 @@ class VLMAgent(AgentBase):
         object_in_hand = None
         if self.tongsim and self.character_id:
             try:
-                object_in_hand = self.tongsim.get_object_in_hand(self.character_id)
+                object_in_hand = self._query_object_in_hand()
             except Exception as exc:
                 logger.warning(f"获取手中物体失败: {exc}")
 
@@ -314,7 +324,8 @@ class VLMAgent(AgentBase):
         self._after_prompt_hook(subject)
 
         # 5: 调用大模型
-        response = self.vlm_client.invoke(messages) if self.vlm_client else None
+        vlm_client = self._vlm_client_for_current_task()
+        response = vlm_client.invoke(messages) if vlm_client else None
         response_text = getattr(response, "text", None) or ""
         json_parsed_message = extract_last_json_from_text(response_text)
         self.last_json_parse_message = json_parsed_message
@@ -458,8 +469,19 @@ class VLMAgent(AgentBase):
         )
         return self._action_histories
 
+    def _vlm_client_for_current_task(self):
+        """任务可以挂一个专属模型；默认仍用主视觉模型。"""
+        return self.vlm_client
+
     def _before_prompt_hook(self, subject):
         if isinstance(subject, dict):
+            # 赛题系统各版本下发的字段差异很大（例如整理房间的目标清单），
+            # 出问题时先看这一行就知道这次到底给了什么。
+            logger.debug(
+                "Prompt subject keys={} payload={}",
+                sorted(subject),
+                repr(subject)[:2000],
+            )
             for data_key in ("task_data", "stage_data"):
                 if data_key in subject and subject[data_key]:
                     self._materialize_task_data_images(subject[data_key])
@@ -635,10 +657,9 @@ class VLMAgent(AgentBase):
         target_loc = self._coerce_location(target_loc)
 
         try:
-            object_in_hand = self.tongsim.get_object_in_hand(self.character_id)
+            object_in_hand = self._query_object_in_hand()
             if object_in_hand:
-                _, which_hand = object_in_hand
-                which_hand = int(which_hand)
+                which_hand = int(object_in_hand[1])
                 drop_loc = self._get_current_forward_drop_location(forward_offset_cm=10.0)
                 if not drop_loc:
                     drop_loc = target_loc
@@ -865,7 +886,9 @@ class VLMAgent(AgentBase):
         if mapped_id is None:
             return obj_id
         raw_id = self.semantic_mapper.get_raw_id(mapped_id)
-        return raw_id
+        # 计数任务直接从统一感知取服务端原始 ID，从不填充 SemanticMapper，因此
+        # 查不到映射时传入的就已经是原始 ID，原样透传而不是判为无效。
+        return raw_id if raw_id is not None else obj_id
 
     def _handle_look_at_location(self, params: dict[str, Any], action: dict[str, Any]) -> Any:
         target_location = self._get_param(params, "target_location", "location")
@@ -905,14 +928,37 @@ class VLMAgent(AgentBase):
     def _handle_move_and_take(self, params: dict[str, Any], action: dict[str, Any]) -> Any:
         obj_id = self._get_param(params, "object_id", "object")
         raw_obj_id = self._to_raw_object_id(obj_id)
-        if raw_obj_id not in self._movable_objects:
+        # 任务系统没给出可搬动清单时不拦截（912 初赛就不给），交给服务端和
+        # 本地几何校验兜底；给出了清单的老版本仍按清单严格限制。
+        if self._movable_objects and raw_obj_id not in self._movable_objects:
             return {"result": "failed", "error": "can not take this object"}
 
         which_hand = self._get_param(params, "which_hand", default=0)
         if not raw_obj_id:
             logger.error("缺少 object_id，无法执行 move_and_take_object。")
             return self._fail_result(error="missing required parameter: object_id")
+        self._last_pick_raw_id = str(raw_obj_id)
         return self.tongsim.move_and_take_object(self.character_id, raw_obj_id, which_hand=which_hand)
+
+    def _query_object_in_hand(self) -> tuple[str | None, int] | None:
+        """返回 (raw_object_id, hand_idx)，手里没东西时返回 None。
+
+        较新的服务端删掉了 get_object_in_hand，只用 has_object_in_hand 回答"有没有"。
+        抓取是拿到物体的唯一途径，所以用最近一次抓取目标补上 ID；ID 未知时返回
+        (None, hand_idx)，调用方据此知道自己拿着东西但认不出是哪个。
+        """
+        query = getattr(self.tongsim, "has_object_in_hand", None)
+        if query is not None:
+            hand = query(self.character_id)
+            if hand is not None:
+                has_object, hand_idx = hand
+                if not has_object:
+                    return None
+                return (self._last_pick_raw_id, int(hand_idx or 0))
+        legacy = self.tongsim.get_object_in_hand(self.character_id)
+        if not legacy:
+            return None
+        return (str(legacy[0]), int(legacy[1]))
 
     def _handle_put_in_container(self, params: dict[str, Any], action: dict[str, Any]) -> Any:
         which_hand = self._get_param(params, "which_hand", default=0)
@@ -1031,7 +1077,17 @@ class VLMAgent(AgentBase):
             return self._fail_result(error="missing required parameter: npc_name")
 
         npc_asset_name = self._npc_name_to_asset_name.get(npc_name)
-        npc_object_id = self.tongsim.get_object_id_by_name(npc_asset_name) if npc_asset_name else None
+        if not npc_asset_name:
+            return self._fail_result(error=f"npc not found: {npc_name}")
+
+        # 较新服务端直接按资产名寻路，不再需要先解析出 object_id。
+        mover = getattr(self.tongsim, "move_to_npc", None)
+        if mover is not None:
+            result = mover(self.character_id, npc_asset_name)
+            if result is not None:
+                return result
+
+        npc_object_id = self.tongsim.get_object_id_by_name(npc_asset_name)
         logger.info(
             "move_to_npc got npc_name {} mapped to asset_name {} and object_id {}",
             npc_name,

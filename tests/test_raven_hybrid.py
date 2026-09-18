@@ -306,7 +306,7 @@ class RavenRuntimeSafetyTests(unittest.TestCase):
             "RAVEN_TEXT_API_BASE": "",
         }
         with patch.dict("os.environ", environment, clear=False), patch(
-            "arenaagent.preliminary_baseline_agent.text_client.ClientFactory.build",
+            "arenaagent.preliminary_baseline_agent.aux_client.ClientFactory.build",
             return_value=sentinel,
         ) as build:
             client = build_raven_text_client_from_env()
@@ -325,7 +325,7 @@ class RavenRuntimeSafetyTests(unittest.TestCase):
             "DEEPSEEK_API_KEY": "",
         }
         with patch.dict("os.environ", environment, clear=False), patch(
-            "arenaagent.preliminary_baseline_agent.text_client.ClientFactory.build"
+            "arenaagent.preliminary_baseline_agent.aux_client.ClientFactory.build"
         ) as build:
             client = build_raven_text_client_from_env()
         self.assertIsNone(client)

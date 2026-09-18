@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from arenaagent.preliminary_baseline_agent.text_client import build_text_client_from_env
+from arenaagent.preliminary_baseline_agent.aux_client import build_aux_client_from_env
 
 
 DEFAULT_COUNTING_REVIEW_MODEL = "kimi-k2.7-code-highspeed"
@@ -12,7 +12,7 @@ DEFAULT_COUNTING_REVIEW_TIMEOUT_SECONDS = 90.0
 
 def build_counting_review_client_from_env() -> Any | None:
     """Build a fast vision reviewer so candidate verification skips the slow main model."""
-    return build_text_client_from_env(
+    return build_aux_client_from_env(
         enable_env="COUNTING_ENABLE_REVIEW_MODEL",
         prefix="COUNTING_REVIEW",
         label="independent counting review model",

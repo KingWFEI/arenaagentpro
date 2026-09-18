@@ -27,6 +27,10 @@ from arenaagent.preliminary_baseline_agent.tasks.npc.text_client import (
 from arenaagent.preliminary_baseline_agent.tasks.raven.text_client import (
     build_raven_text_client_from_env,
 )
+from arenaagent.preliminary_baseline_agent.tasks.tidyroom.survey import run_scene_survey
+from arenaagent.preliminary_baseline_agent.tasks.tidyroom.vlm_client import (
+    build_tidyroom_vision_client_from_env,
+)
 from arenaagent.utils.configclass import configclass
 from arenaagent.vlm_agent.raven_skill import record_confirmed_raven_experience
 from arenaagent.vlm_agent.vlm_agent import VLMAgent, VLMAgentCfg
@@ -62,6 +66,7 @@ class PreliminaryBaselineAgent(VLMAgent):
     _TIDYROOM_SEGMENTATION_GAP_RATIO = 0.20
     _TIDYROOM_SEGMENTATION_MIN_GAP = 3
     _TIDYROOM_MIN_MAPPED_PIXEL_COVERAGE = 0.50
+    _TIDYROOM_SURVEY_MAX_FRAMES = 8
 
     def __init__(
         self,
@@ -86,12 +91,15 @@ class PreliminaryBaselineAgent(VLMAgent):
         self._spawn_yaw: float | None = None
         self._tidyroom_post_turn_diagnostic_sequence = 0
         self._tidyroom_post_turn_perception_blocked = False
+        self._tidyroom_survey_frames: list[str] = []
         self.raven_text_client = None
         self._raven_text_client_initialized = False
         self.npc_text_client = None
         self._npc_text_client_initialized = False
         self.counting_review_client = None
         self._counting_review_client_initialized = False
+        self.tidyroom_vlm_client = None
+        self._tidyroom_vlm_client_initialized = False
         self._jigsaw_attempt_subject_key: tuple[str, str] | None = None
 
     def init(self, opt: dict[str, Any]) -> None:
@@ -119,6 +127,11 @@ class PreliminaryBaselineAgent(VLMAgent):
 
     def _should_handle_piece_transfer(self) -> bool:
         return False
+
+    def _vlm_client_for_current_task(self):
+        if self._active_task_type == "tidyroom" and self.tidyroom_vlm_client is not None:
+            return self.tidyroom_vlm_client
+        return super()._vlm_client_for_current_task()
 
     def _run_subject(self) -> None:
         """整理房间使用本地快速循环，其他四类任务保持原有服务循环。"""
@@ -289,6 +302,9 @@ class PreliminaryBaselineAgent(VLMAgent):
         if task_type == "counting" and not self._counting_review_client_initialized:
             self.counting_review_client = build_counting_review_client_from_env()
             self._counting_review_client_initialized = True
+        if task_type == "tidyroom" and not self._tidyroom_vlm_client_initialized:
+            self.tidyroom_vlm_client = build_tidyroom_vision_client_from_env()
+            self._tidyroom_vlm_client_initialized = True
         safe_subject = dict(subject) if isinstance(subject, dict) else {"subject": str(subject)}
         identity = str(
             safe_subject.get("subject_id")
@@ -330,6 +346,18 @@ class PreliminaryBaselineAgent(VLMAgent):
         self._last_executed_action_name = ""
         self._tidyroom_post_turn_diagnostic_sequence = 0
         self._tidyroom_post_turn_perception_blocked = False
+        self._tidyroom_survey_frames: list[str] = []
+
+    def _remember_survey_frame(self, image_b64: str | None) -> None:
+        """留一份扫描期的画面，供扫完整圈后一次性标注使用。
+
+        模型只认它看得见的东西，一帧一帧问会让同一件家具在不同帧里得到互相
+        矛盾的标签；攒齐一圈一起发，它才能给出全局一致的那份。
+        """
+        if not image_b64:
+            return
+        self._tidyroom_survey_frames.append(image_b64)
+        del self._tidyroom_survey_frames[: -self._TIDYROOM_SURVEY_MAX_FRAMES]
 
     def run_step(self, subject: Any, task_response: dict[str, Any]) -> dict[str, Any]:
         strategy = self._ensure_task_strategy(subject)
@@ -350,6 +378,10 @@ class PreliminaryBaselineAgent(VLMAgent):
                     {},
                     {"think": "拼图专用求解器完成三块拼图的放置。", "output": 0},
                 )
+
+        if self._active_task_type == "tidyroom" and strategy.survey_is_due():
+            strategy.note_survey_attempted()
+            run_scene_survey(strategy, self)
 
         previous_tail = self._action_histories[-1] if self._action_histories else None
         action_result = super().run_step(subject, task_response)
@@ -434,6 +466,7 @@ class PreliminaryBaselineAgent(VLMAgent):
                 attempt,
             )
             if consistent:
+                self._remember_survey_frame(result[0])
                 return result
 
         self._tidyroom_post_turn_perception_blocked = True

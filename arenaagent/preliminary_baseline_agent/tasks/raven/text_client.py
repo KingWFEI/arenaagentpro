@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from arenaagent.preliminary_baseline_agent.text_client import build_text_client_from_env
+from arenaagent.preliminary_baseline_agent.aux_client import build_aux_client_from_env
 
 
 DEFAULT_RAVEN_TEXT_MODEL = "deepseek-v4-pro"
@@ -12,7 +12,7 @@ DEFAULT_RAVEN_TEXT_TIMEOUT_SECONDS = 35.0
 
 def build_raven_text_client_from_env() -> Any | None:
     """Build an independent DeepSeek verifier without reusing visual credentials."""
-    return build_text_client_from_env(
+    return build_aux_client_from_env(
         enable_env="RAVEN_ENABLE_TEXT_VERIFIER",
         prefix="RAVEN_TEXT",
         label="independent Raven text verifier",

@@ -9,7 +9,7 @@ from arenaagent.vlm_agent.client import ClientFactory
 from arenaagent.vlm_agent.vlm_config import VLMClientCfg
 
 
-def build_text_client_from_env(
+def build_aux_client_from_env(
     *,
     enable_env: str,
     prefix: str,
@@ -19,7 +19,10 @@ def build_text_client_from_env(
     default_timeout_seconds: float = 35.0,
     api_key_fallbacks: tuple[str, ...] = (),
 ) -> Any | None:
-    """Build an independent OpenAI-compatible text client from <prefix>_* env vars."""
+    """Build an independent OpenAI-compatible client from <prefix>_* env vars.
+
+    文本复核与任务专属视觉模型共用这一套构造；两者只是模型和 endpoint 不同。
+    """
     enabled = os.getenv(enable_env, "1").strip().lower()
     if enabled in {"0", "false", "no", "off"}:
         logger.info("{} is disabled by environment", label)

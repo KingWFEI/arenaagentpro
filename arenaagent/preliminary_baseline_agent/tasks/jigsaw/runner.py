@@ -34,13 +34,16 @@ def run_dedicated_jigsaw(agent: Any, subject: dict[str, Any]) -> None:
     if agent.tongsim is None or agent.semantic_mapper is None or not agent.character_id:
         raise RuntimeError("jigsaw scene client is not initialized")
 
-    legacy_rpc = hasattr(getattr(agent.tongsim, "_stub", None), "acquire_first_person_perception")
-    if legacy_rpc:
-        perception = agent.tongsim.acquire_first_person_perception(
-            agent.character_id,
-            width=1280,
-            height=720,
-        )
+    acquire_unified = getattr(agent.tongsim, "acquire_first_person_perception", None)
+    perception = (
+        acquire_unified(agent.character_id, width=1280, height=720)
+        if acquire_unified is not None
+        else None
+    )
+    # 服务端自带原子感知时，它也一定带 put_down_sth 和 move_and_take_object 的
+    # movable_object_ids；老服务端两者都没有，走另一套等价动作。
+    unified_rpc = perception is not None
+    if unified_rpc:
         image = perception.get("image")
         objects = perception.get("objects") or []
         enriched = []
@@ -92,7 +95,7 @@ def run_dedicated_jigsaw(agent: Any, subject: dict[str, Any]) -> None:
         candidate = candidates[placement["object_id"]]
         object_id = candidate["raw_object_id"]
         _require_success("approach candidate", agent.tongsim.move_to_object(agent.character_id, object_id))
-        if legacy_rpc:
+        if unified_rpc:
             take = agent.tongsim.move_and_take_object(
                 agent.character_id,
                 object_id,
@@ -111,7 +114,7 @@ def run_dedicated_jigsaw(agent: Any, subject: dict[str, Any]) -> None:
             "approach destination",
             agent.tongsim.move_to_location(agent.character_id, target, stop_distance=30.0),
         )
-        if legacy_rpc:
+        if unified_rpc:
             put_result = agent.tongsim.put_down_sth(
                 agent.character_id,
                 target_location=target,
@@ -129,7 +132,7 @@ def run_dedicated_jigsaw(agent: Any, subject: dict[str, Any]) -> None:
                 force_locate=True,
             )
         _require_success("place candidate", put_result)
-        if not legacy_rpc:
+        if not unified_rpc:
             after = agent.tongsim.get_object_basic_info(object_id)
             location = after.get("place_location") if isinstance(after, dict) else None
             if isinstance(location, dict) and all(axis in location for axis in ("X", "Y", "Z")):
@@ -147,7 +150,7 @@ def run_dedicated_jigsaw(agent: Any, subject: dict[str, Any]) -> None:
         location = board_piece.get("place_location") or {}
         target = [float(location[axis]) for axis in ("X", "Y", "Z")]
         _require_success("approach board piece", agent.tongsim.move_to_object(agent.character_id, object_id))
-        if legacy_rpc:
+        if unified_rpc:
             take = agent.tongsim.move_and_take_object(
                 agent.character_id,
                 object_id,
@@ -161,7 +164,7 @@ def run_dedicated_jigsaw(agent: Any, subject: dict[str, Any]) -> None:
             "approach board cell",
             agent.tongsim.move_to_location(agent.character_id, target, stop_distance=30.0),
         )
-        if legacy_rpc:
+        if unified_rpc:
             result = agent.tongsim.put_down_sth(
                 agent.character_id,
                 target_location=target,
@@ -184,7 +187,7 @@ def run_dedicated_jigsaw(agent: Any, subject: dict[str, Any]) -> None:
     # Newer servers can address a hand while force-locating, so prefetch two
     # pieces at a time. The competition's legacy RPC auto-selects the release
     # hand; keep that path single-handed to avoid swapping two image tiles.
-    if legacy_rpc:
+    if unified_rpc:
         for placement in mapping:
             take_piece(placement, which_hand=0)
             place_piece(placement, which_hand=0)

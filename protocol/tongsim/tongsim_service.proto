@@ -12,6 +12,7 @@ service TongSimService {
   rpc heartbeat(google.protobuf.Struct)         returns (google.protobuf.Struct) {}
 
   // Perception
+  rpc acquire_first_person_perception(google.protobuf.Struct) returns (google.protobuf.Struct) {}
   rpc acquire_first_person_image(google.protobuf.Struct)           returns (google.protobuf.Struct) {}
   rpc acquire_first_person_segmantic_image(google.protobuf.Struct) returns (google.protobuf.Struct) {}
   rpc fetch_first_person_visible_objects(google.protobuf.Struct)   returns (google.protobuf.Struct) {}
