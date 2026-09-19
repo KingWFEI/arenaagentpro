@@ -3,15 +3,19 @@ from __future__ import annotations
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from arenaagent.preliminary_baseline_agent.preliminary_baseline_agent import PreliminaryBaselineAgent
-from arenaagent.preliminary_baseline_agent.tasks.counting.runtime import run_counting_subject
+from arenaagent.preliminary_baseline_agent.tasks.counting.runtime import (
+    counting_subject_signature,
+    run_counting_subject,
+)
 
 from arenaagent.preliminary_baseline_agent.tasks.counting.strategy import (
     CountingMemory,
     CountingRecord,
     CountingStrategy,
+    OcclusionPlan,
     _matches_competition_apple,
     _matches_competition_cup,
     _parse_review_response,
@@ -86,6 +90,18 @@ class CountingProtocolTests(unittest.TestCase):
 
         self.assertEqual(ranked[0], 5)
         self.assertGreater(ranked.index(0), ranked.index(5))
+
+    def test_recovery_prefers_plus_one_after_low_count_rejection(self):
+        strategy = CountingStrategy()
+        subject = {
+            "question": "房间中有多少个碗？",
+            "options": {"A": 11, "B": 3, "C": 0, "D": 5, "F": 2, "G": 1},
+        }
+        strategy.reset(subject)
+
+        ranked = strategy.ranked_recovery_counts(subject, {2})
+
+        self.assertEqual(ranked[0], 3)
 
     def test_competition_cup_prototype_excludes_larger_white_containers(self):
         red_cup = CountingRecord("cup", color="Red", shape="Cylinder", size=(7, 7, 8))
@@ -360,15 +376,387 @@ class CountingIntegrationTests(unittest.TestCase):
             {"answer_right": True},
         ]
         agent.action_space = {"key": "answer"}
-        agent.cfg = SimpleNamespace(counting_max_recovery_submissions=7)
+        agent.cfg = SimpleNamespace(counting_max_recovery_submissions=1)
         run_counting_subject(agent, {"task_type": "counting", "options": {"A": 3, "B": 4, "C": 5}})
         self.assertEqual([call.args[0] for call in agent._apply_action.call_args_list],
                          [{"answer": 3}, {"answer": 4}])
         self.assertTrue(agent.subject_finished)
         agent._evaluate_subject.assert_called_once()
 
+    def test_stale_option_mapping_aborts_before_recovery_bruteforce(self):
+        strategy = Mock()
+        strategy.run_fast.return_value = {"answer": 1}
+        strategy.ranked_recovery_counts.return_value = [0, 4, 5, 6]
+        agent = Mock()
+        agent._ensure_task_strategy.return_value = strategy
+        agent._raven_current_subject_index.return_value = 1
+        # Local stale options map value 1 to B, while the new server subject
+        # maps it to G.  This is the transition race observed in the real run.
+        agent._apply_action.return_value = {"answer_right": False, "selected_option": "G"}
+        agent.action_space = {"key": "answer"}
+        agent.cfg = SimpleNamespace(counting_max_recovery_submissions=1)
+
+        with self.assertRaisesRegex(RuntimeError, "subject/options changed"):
+            run_counting_subject(
+                agent,
+                {"task_type": "counting", "options": {"A": 12, "B": 1, "C": 13}},
+            )
+
+        self.assertEqual(agent._apply_action.call_count, 1)
+        agent._evaluate_subject.assert_not_called()
+
+    def test_previous_completed_subject_refreshes_in_same_agent_before_perception(self):
+        subject = {
+            "task_type": "counting",
+            "counting_type": "CountingObjects",
+            "question": "一共有多少个苹果在房间中？",
+            "options": {"B": 1, "G": 5},
+        }
+        refreshed = {
+            "task_type": "counting",
+            "counting_type": "CountingObjects",
+            "question": "房间中有多少个碗？",
+            "options": {"A": 2, "B": 3},
+        }
+        agent = Mock()
+        agent._previous_completed_counting_signature = counting_subject_signature(subject)
+        agent._get_subject_from_task.return_value = refreshed
+        strategy = Mock()
+        strategy.run_fast.return_value = {"answer": 3}
+        agent._ensure_task_strategy.return_value = strategy
+        agent._raven_current_subject_index.return_value = 2
+        agent._apply_action.return_value = {"answer_right": True, "selected_option": "B"}
+        agent.action_space = {"key": "answer"}
+
+        run_counting_subject(agent, subject)
+
+        agent._get_subject_from_task.assert_called_once_with()
+        strategy.run_fast.assert_called_once_with(agent, refreshed, {})
+        agent._apply_action.assert_called_once_with({"answer": 3})
+        agent._evaluate_subject.assert_called_once_with()
+
 
 class CountingFastPathTests(unittest.TestCase):
+    @staticmethod
+    def _seed_occluded_apple_scene(strategy):
+        apples = [
+            observed(str(index), "Round", "Red", x=index * 20, size=12)
+            for index in range(1, 5)
+        ]
+        furniture = observed("bed", "Rectangle", "Brown", x=120, y=40, size=10)
+        furniture["world_aabb"]["max"] = {"x": 360, "y": 150, "z": 90}
+        strategy.memory.add(0, None, [*apples, furniture])
+
+    def test_empty_apple_rescan_uses_second_occlusion_position_before_submit(self):
+        agent = FakeAgent()
+        agent._spawn_xy = (0.0, 0.0)
+        strategy = CountingStrategy()
+        subject = {
+            "task_type": "counting",
+            "counting_type": "CountingObjects",
+            "question": "一共有多少个苹果在房间中？",
+            "options": {"E": 4, "G": 5},
+        }
+        strategy.reset(subject)
+
+        def initial_scan(*_args):
+            self._seed_occluded_apple_scene(strategy)
+
+        def reveal_fifth(*_args, **_kwargs):
+            strategy.memory.add(120, None, [observed("fifth", "Round", "Red", x=220, size=12)])
+
+        plan = OcclusionPlan("o5", 180.0, 100.0)
+        with patch.object(strategy, "_capture_panorama", side_effect=initial_scan), \
+                patch.object(strategy, "_select_occlusion_plan", return_value=plan), \
+                patch.object(strategy, "_move_to_occlusion_zone", return_value=(True, 180.0)), \
+                patch.object(strategy, "_capture_full_post_move_scan", return_value=set()), \
+                patch.object(strategy, "_move_to_alternate_occlusion_side", return_value=True) as alternate, \
+                patch.object(strategy, "_capture_directed_occlusion_views", side_effect=reveal_fifth):
+            result = strategy.run_fast(agent, subject, {})
+
+        self.assertEqual(result, {"answer": 5})
+        alternate.assert_called_once_with(agent, plan, side="left")
+        self.assertEqual(strategy.exploration_moves, 2)
+
+    def test_apple_total_four_after_one_new_candidate_still_uses_second_position(self):
+        agent = FakeAgent()
+        agent._spawn_xy = (0.0, 0.0)
+        strategy = CountingStrategy()
+        subject = {
+            "task_type": "counting",
+            "counting_type": "CountingObjects",
+            "question": "一共有多少个苹果在房间中？",
+            "options": {"E": 4, "G": 5},
+        }
+        strategy.reset(subject)
+
+        def initial_scan(*_args):
+            apples = [
+                observed(str(index), "Round", "Red", x=index * 20, size=12)
+                for index in range(1, 4)
+            ]
+            furniture = observed("bed", "Rectangle", "Brown", x=120, y=40, size=10)
+            furniture["world_aabb"]["max"] = {"x": 360, "y": 150, "z": 90}
+            strategy.memory.add(0, None, [*apples, furniture])
+
+        def primary_scan(*_args):
+            view = strategy.memory.add(
+                180,
+                None,
+                [observed("fourth", "Round", "Red", x=200, size=12)],
+            )
+            return set(view.object_ids)
+
+        def reveal_fifth(*_args, **_kwargs):
+            strategy.memory.add(120, None, [observed("fifth", "Round", "Red", x=240, size=12)])
+
+        plan = OcclusionPlan("o4", 180.0, 100.0)
+        with patch.object(strategy, "_capture_panorama", side_effect=initial_scan), \
+                patch.object(strategy, "_select_occlusion_plan", return_value=plan), \
+                patch.object(strategy, "_move_to_occlusion_zone", return_value=(True, 180.0)), \
+                patch.object(strategy, "_capture_full_post_move_scan", side_effect=primary_scan), \
+                patch.object(strategy, "_move_to_alternate_occlusion_side", return_value=True) as alternate, \
+                patch.object(strategy, "_capture_directed_occlusion_views", side_effect=reveal_fifth):
+            result = strategy.run_fast(agent, subject, {})
+
+        self.assertEqual(result, {"answer": 5})
+        alternate.assert_called_once_with(agent, plan, side="left")
+        self.assertEqual(strategy.exploration_moves, 2)
+
+    def test_secondary_occlusion_checks_other_side_when_first_side_finds_nothing(self):
+        agent = FakeAgent()
+        agent._spawn_xy = (0.0, 0.0)
+        strategy = CountingStrategy()
+        subject = {
+            "task_type": "counting",
+            "counting_type": "CountingObjects",
+            "question": "一共有多少个苹果在房间中？",
+            "options": {"E": 4, "G": 5},
+        }
+        strategy.reset(subject)
+
+        def initial_scan(*_args):
+            self._seed_occluded_apple_scene(strategy)
+
+        passes = 0
+
+        def reveal_only_on_other_side(*_args, **_kwargs):
+            nonlocal passes
+            passes += 1
+            if passes == 2:
+                strategy.memory.add(
+                    240,
+                    None,
+                    [observed("fifth", "Round", "Red", x=240, size=12)],
+                )
+
+        plan = OcclusionPlan("o5", 180.0, 100.0)
+        with patch.object(strategy, "_capture_panorama", side_effect=initial_scan), \
+                patch.object(strategy, "_select_occlusion_plan", return_value=plan), \
+                patch.object(strategy, "_move_to_occlusion_zone", return_value=(True, 180.0)), \
+                patch.object(strategy, "_capture_full_post_move_scan", return_value=set()), \
+                patch.object(strategy, "_move_to_alternate_occlusion_side", return_value=True) as alternate, \
+                patch.object(
+                    strategy,
+                    "_capture_directed_occlusion_views",
+                    side_effect=reveal_only_on_other_side,
+                ):
+            result = strategy.run_fast(agent, subject, {})
+
+        self.assertEqual(result, {"answer": 5})
+        self.assertEqual(
+            alternate.call_args_list,
+            [
+                call(agent, plan, side="left"),
+                call(agent, plan, side="right"),
+            ],
+        )
+        self.assertEqual(strategy.exploration_moves, 3)
+
+    def test_apple_rescan_that_finds_candidate_skips_second_position(self):
+        agent = FakeAgent()
+        agent._spawn_xy = (0.0, 0.0)
+        strategy = CountingStrategy()
+        subject = {
+            "task_type": "counting",
+            "counting_type": "CountingObjects",
+            "question": "一共有多少个苹果在房间中？",
+            "options": {"E": 4, "G": 5},
+        }
+        strategy.reset(subject)
+
+        def initial_scan(*_args):
+            self._seed_occluded_apple_scene(strategy)
+
+        def primary_scan(*_args):
+            strategy.memory.add(180, None, [observed("fifth", "Round", "Red", x=220, size=12)])
+            return {"o6"}
+
+        plan = OcclusionPlan("o5", 180.0, 100.0)
+        with patch.object(strategy, "_capture_panorama", side_effect=initial_scan), \
+                patch.object(strategy, "_select_occlusion_plan", return_value=plan), \
+                patch.object(strategy, "_move_to_occlusion_zone", return_value=(True, 180.0)), \
+                patch.object(strategy, "_capture_full_post_move_scan", side_effect=primary_scan), \
+                patch.object(strategy, "_move_to_alternate_occlusion_side") as alternate:
+            result = strategy.run_fast(agent, subject, {})
+
+        self.assertEqual(result, {"answer": 5})
+        alternate.assert_not_called()
+        self.assertEqual(strategy.exploration_moves, 1)
+
+    def test_settled_three_apple_subject_skips_expensive_secondary_sides(self):
+        agent = FakeAgent()
+        agent._spawn_xy = (0.0, 0.0)
+        strategy = CountingStrategy()
+        subject = {
+            "task_type": "counting",
+            "counting_type": "CountingObjects",
+            "question": "一共有多少个苹果在房间中？",
+            "options": {"E": 3, "G": 5},
+        }
+        strategy.reset(subject)
+
+        def initial_scan(*_args):
+            apples = [
+                observed(str(index), "Round", "Red", x=index * 20, size=12)
+                for index in range(1, 4)
+            ]
+            furniture = observed("bed", "Rectangle", "Brown", x=120, y=40, size=10)
+            furniture["world_aabb"]["max"] = {"x": 360, "y": 150, "z": 90}
+            strategy.memory.add(0, None, [*apples, furniture])
+
+        plan = OcclusionPlan("o4", 180.0, 100.0)
+        with patch.object(strategy, "_capture_panorama", side_effect=initial_scan), \
+                patch.object(strategy, "_select_occlusion_plan", return_value=plan), \
+                patch.object(strategy, "_move_to_occlusion_zone", return_value=(True, 180.0)), \
+                patch.object(strategy, "_capture_full_post_move_scan", return_value=set()), \
+                patch.object(strategy, "_move_to_alternate_occlusion_side") as alternate:
+            result = strategy.run_fast(agent, subject, {})
+
+        self.assertEqual(result, {"answer": 3})
+        alternate.assert_not_called()
+        self.assertEqual(strategy.exploration_moves, 0)
+
+    def test_stable_four_apples_behind_large_blocker_infers_hidden_fifth_without_move(self):
+        agent = FakeAgent()
+        agent._spawn_xy = (0.0, 0.0)
+        strategy = CountingStrategy()
+        subject = {
+            "task_type": "counting",
+            "counting_type": "CountingObjects",
+            "question": "一共有多少个苹果在房间中？",
+            "options": {"E": 4, "G": 5},
+        }
+        strategy.reset(subject)
+
+        def stable_scan(*_args):
+            self._seed_occluded_apple_scene(strategy)
+
+        plan = OcclusionPlan("o5", 180.0, 22_526.1)
+        with patch.object(strategy, "_capture_panorama", side_effect=stable_scan) as panorama, \
+                patch.object(strategy, "_select_occlusion_plan", return_value=plan), \
+                patch.object(strategy, "_move_to_occlusion_zone") as move:
+            result = strategy.run_fast(agent, subject, {})
+
+        self.assertEqual(result, {"answer": 5})
+        self.assertEqual(panorama.call_count, 2)
+        move.assert_not_called()
+        self.assertEqual(strategy.exploration_moves, 0)
+
+    def test_stable_three_digital_clocks_behind_large_blocker_infers_four_without_move(self):
+        agent = FakeAgent()
+        agent._spawn_xy = (0.0, 0.0)
+        strategy = CountingStrategy()
+        subject = {
+            "task_type": "counting",
+            "counting_type": "CountingObjects",
+            "question": "房间中有多少个钟表？",
+            "options": {"A": 4, "B": 3},
+        }
+        strategy.reset(subject)
+
+        def stable_scan(*_args):
+            clocks = []
+            for index in range(3):
+                clock = observed(
+                    f"clock-{index}",
+                    "Rectangle",
+                    "Black",
+                    x=index * 30,
+                    size=3,
+                )
+                clock["world_aabb"]["max"] = {
+                    "x": index * 30 + 11,
+                    "y": 5,
+                    "z": 3.4,
+                }
+                clocks.append(clock)
+            furniture = observed("bed", "Rectangle", "Brown", x=120, y=40, size=10)
+            furniture["world_aabb"]["max"] = {"x": 360, "y": 150, "z": 90}
+            strategy.memory.add(0, None, [*clocks, furniture])
+
+        plan = OcclusionPlan("o4", 180.0, 22_526.1)
+        with patch.object(strategy, "_capture_panorama", side_effect=stable_scan) as panorama, \
+                patch.object(strategy, "_select_occlusion_plan", return_value=plan), \
+                patch.object(strategy, "_move_to_occlusion_zone") as move:
+            result = strategy.run_fast(agent, subject, {})
+
+        self.assertEqual(result, {"answer": 4})
+        self.assertEqual(panorama.call_count, 2)
+        move.assert_not_called()
+        self.assertEqual(strategy.exploration_moves, 0)
+
+    def test_stable_spawn_fast_paths_for_cup_backpack_and_bottle_never_translate(self):
+        cases = (
+            (
+                "cup",
+                "房间中有多少个杯子？",
+                5,
+                [observed(f"cup-{index}", "Cylinder", "Red", x=index * 20, size=8)
+                 for index in range(5)],
+            ),
+            (
+                "backpack",
+                "房间中有多少个背包？",
+                2,
+                [observed(f"bag-{index}", "Backpack", "Blue", x=index * 30, size=20)
+                 for index in range(2)],
+            ),
+            (
+                "bottle",
+                "房间中有多少个瓶子？",
+                3,
+                [observed(f"bottle-{index}", "Bottle", "White", x=index * 20, size=15)
+                 for index in range(3)],
+            ),
+        )
+        for category, question, count, targets in cases:
+            with self.subTest(category=category):
+                agent = FakeAgent()
+                agent._spawn_xy = (0.0, 0.0)
+                strategy = CountingStrategy()
+                subject = {
+                    "task_type": "counting",
+                    "counting_type": "CountingObjects",
+                    "question": question,
+                    "options": {"A": count, "B": count + 1},
+                }
+                strategy.reset(subject)
+                furniture = observed("bed", "Rectangle", "Brown", x=120, y=40, size=10)
+                furniture["world_aabb"]["max"] = {"x": 360, "y": 150, "z": 90}
+
+                def stable_scan(*_args, targets=targets, furniture=furniture):
+                    strategy.memory.add(0, None, [*targets, furniture])
+
+                with patch.object(strategy, "_capture_panorama", side_effect=stable_scan) as panorama, \
+                        patch.object(strategy, "_move_to_occlusion_zone") as move:
+                    result = strategy.run_fast(agent, subject, {})
+
+                self.assertEqual(result, {"answer": count})
+                self.assertEqual(panorama.call_count, 2)
+                move.assert_not_called()
+                self.assertEqual(strategy.exploration_moves, 0)
+
     def test_corner_route_moves_once_and_scans_only_ninety_degrees(self):
         agent = FakeAgent()
         agent._spawn_xy = (282.0, -353.0)
@@ -410,8 +798,8 @@ class CountingFastPathTests(unittest.TestCase):
         self.assertEqual(result, {"answer": 1})
         self.assertEqual(len(strategy.memory.records), 2)
         self.assertEqual(agent.vlm_client.calls, 0)
-        self.assertEqual(agent.capture_calls, 8)
-        self.assertIn("move_forward", agent.events)
+        self.assertEqual(agent.capture_calls, 6)
+        self.assertNotIn("move_forward", agent.events)
         self.assertEqual(agent.actions[-1]["action"], "submit_answer")
 
     def test_reliable_bowl_count_stops_after_panorama_and_submits_count(self):
@@ -428,7 +816,7 @@ class CountingFastPathTests(unittest.TestCase):
         result = strategy.run_fast(agent, subject, {})
 
         self.assertEqual(result, {"answer": 1})
-        self.assertEqual(agent.capture_calls, 4)
+        self.assertEqual(agent.capture_calls, 3)
         self.assertEqual(agent.vlm_client.calls, 0)
         self.assertEqual(agent.actions[-1]["action"], "submit_answer")
 
@@ -469,6 +857,51 @@ class CountingFastPathTests(unittest.TestCase):
         self.assertEqual(agent.actions[-1]["action"], "move_to_object")
         self.assertEqual(agent.actions[-1]["parameters"]["object_id"], "17")
         self.assertEqual(agent.capture_calls, 0)
+
+    def test_occlusion_move_uses_spawn_coordinate_for_direct_far_side_route(self):
+        strategy = CountingStrategy()
+        strategy.reset({})
+        furniture = observed("17", "Rectangle", "Brown", x=100, y=20, size=10)
+        furniture["world_aabb"]["max"] = {"x": 280, "y": 140, "z": 90}
+        strategy.memory.add(90, None, [furniture])
+        plan = strategy._select_occlusion_plan(SimpleNamespace(_spawn_xy=(0.0, 0.0)))
+        agent = FakeAgent()
+        agent._spawn_xy = (0.0, 0.0)
+
+        moved, heading = strategy._move_to_occlusion_zone(agent, {}, plan)
+
+        self.assertTrue(moved)
+        self.assertEqual(heading, 90)
+        self.assertEqual(agent.actions[-1]["action"], "move_to_location")
+        self.assertEqual(agent.capture_calls, 0)
+
+    def test_directed_scan_can_stop_on_first_new_candidate(self):
+        strategy = CountingStrategy()
+        strategy.reset({})
+        strategy.memory.add(0, None, [observed("first", "Round", "Red", x=20)])
+        agent = FakeAgent()
+        calls = []
+
+        def expose_on_first_view(_agent, _subject, heading):
+            calls.append(heading)
+            return strategy.memory.add(
+                heading,
+                None,
+                [observed("second", "Round", "Red", x=60)],
+            )
+
+        with patch.object(strategy, "_capture_heading", side_effect=expose_on_first_view):
+            new_candidates = strategy._capture_directed_occlusion_views(
+                agent,
+                {},
+                "apple",
+                0.0,
+                keep_searching=True,
+                stop_after_first_new=True,
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(new_candidates), 1)
 
 
 if __name__ == "__main__":

@@ -49,7 +49,13 @@ class PreliminaryBaselineAgentCfg(VLMAgentCfg):
     counting_perception_height: int = 720
     counting_clock_closeups: int = 2
     counting_clock_image_max_width: int = 2000
+    # After an answer is submitted, the 912 controller keeps that Agent in the
+    # subject even if it disconnects.  Recovery must therefore finish in the
+    # same Agent.  The ranking tries +1 first so normal undercounts cost at most
+    # one correction; the remaining public options are only a no-timeout guard.
     counting_max_recovery_submissions: int = 7
+    counting_subject_refresh_timeout_seconds: float = 20.0
+    counting_subject_refresh_interval_seconds: float = 0.5
     counting_corner_move_distance: float = 80.0
     counting_occlusion_clearance: float = 70.0
     # Experimental corner start; the conservative spawn panorama is the scored default.

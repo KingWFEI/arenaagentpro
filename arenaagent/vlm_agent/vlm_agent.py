@@ -156,21 +156,26 @@ class VLMAgent(AgentBase):
         if not self._initialized:
             return
         if self.tongsim:
-            if self.character_id:
-                # 只关通道不会回收角色。仿真端每个角色都带一个相机渲染目标，
-                # 泄漏的角色会一直占着显存，反复运行会不断累积。
-                try:
-                    self.tongsim.destory_character(self.character_id)
-                except Exception as exc:
-                    logger.warning("Failed to destroy character {}: {}", self.character_id, exc)
             if self._close_tongsim_on_deinit:
+                # close() is the client-scoped cleanup operation in the 912
+                # TongSim server.  It also releases the character and its camera.
+                # Calling destory_character() first makes the server release the
+                # same UE capture objects twice.  Real multi-subject runs then
+                # leave an old camera in CaptureTaskCacheList and crash UE after
+                # roughly three destroy+close cycles.
                 try:
                     self.tongsim.close()
                     logger.info("Released TongSim resources for character {}", self.character_id)
                 except Exception as exc:
                     logger.warning("Failed to release TongSim resources for {}: {}", self.character_id, exc)
-            else:
-                logger.info("Released character {} and retained shared TongSim connection", self.character_id)
+            elif self.character_id:
+                # A deliberately shared client must stay open between subjects,
+                # so only its current character can be released here.
+                try:
+                    self.tongsim.destory_character(self.character_id)
+                    logger.info("Released character {} and retained shared TongSim connection", self.character_id)
+                except Exception as exc:
+                    logger.warning("Failed to destroy character {}: {}", self.character_id, exc)
         self.tongsim = None
         self.character_id = None
         self._initialized = False

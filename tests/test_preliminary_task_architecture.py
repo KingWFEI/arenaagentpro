@@ -94,7 +94,9 @@ class TongSimLifecycleTests(unittest.TestCase):
 
         agent.deinit()
 
-        self.assertEqual(client.destroyed, ["single-character"])
+        # close() performs client-scoped cleanup, including the character and
+        # camera.  Calling destory_character() as well double-releases UE state.
+        self.assertEqual(client.destroyed, [])
         self.assertEqual(client.close_calls, 1)
 
 

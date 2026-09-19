@@ -201,11 +201,14 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 def _release_agent_quietly(agent) -> None:
-    """run() 中途抛错时走不到 _disconnect，这里补一次角色回收。"""
+    """Fully unregister a failed agent instead of only releasing its UE state."""
     if agent is None:
         return
     try:
-        agent.deinit()
+        if bool(getattr(agent, "connected", False)):
+            agent._disconnect()
+        else:
+            agent.deinit()
     except Exception as exc:  # pragma: no cover - 尽力而为的清理
         logger.warning("cleanup after failure failed: {}", exc)
 
@@ -259,38 +262,49 @@ def main() -> None:
         logger.error("run_times must be at least 1")
         return
 
-    shared_tongsim = None
-    try:
-        for _ in range(runtimes):
-            channel = _create_channel(grpc_target)
-            stub = TongTestAgentServiceStub(channel)
-            time.sleep(2)  # 等待连接稳定
-            agent = None
-            try:
-                agent = builder.build(args.agent_name, stub=stub, channel=channel)
-                configure_shared_tongsim = getattr(agent, "configure_shared_tongsim", None)
-                if runtimes > 1 and callable(configure_shared_tongsim):
-                    configure_shared_tongsim(shared_tongsim)
+    # Do not reuse one TongSim client across subjects.  In the 912 runtime each
+    # client owns its character camera/capture stream, and close() is the only
+    # reliable atomic cleanup path.  Reusing a client requires an explicit
+    # character destroy followed by a later client close, which can leave stale
+    # capture tasks in UE and cause an access-violation crash.
+    completed = 0
+    attempts = 0
+    max_attempts = max(runtimes * 3, runtimes + 3)
+    previous_completed_counting_signature = None
+    while completed < runtimes and attempts < max_attempts:
+        attempts += 1
+        channel = _create_channel(grpc_target)
+        stub = TongTestAgentServiceStub(channel)
+        time.sleep(2)  # 等待连接稳定
+        agent = None
+        try:
+            agent = builder.build(args.agent_name, stub=stub, channel=channel)
+            if previous_completed_counting_signature is not None:
+                agent._previous_completed_counting_signature = previous_completed_counting_signature
+            agent.load(params)
+            if not bool(getattr(agent, "connected", False)):
+                raise ConnectionError("Agent did not connect to the task server")
+            agent.run()
+            completed += 1
+            completed_signature = getattr(agent, "_completed_counting_subject_signature", None)
+            if isinstance(completed_signature, str):
+                previous_completed_counting_signature = completed_signature
+        except Exception as e:
+            logger.opt(exception=True).warning("error trace back {}", e)
+            _release_agent_quietly(agent)
+            continue
+        finally:
+            logger.info("Closing Arena gRPC channel")
+            channel.close()
+            time.sleep(5)  # 避免短时间内重复创建 Arena 连接
 
-                agent.load(params)
-                if runtimes > 1 and shared_tongsim is None:
-                    shared_tongsim = getattr(agent, "tongsim", None)
-                agent.run()
-            except Exception as e:
-                logger.opt(exception=True).warning("error trace back {}", e)
-                _release_agent_quietly(agent)
-                continue
-            finally:
-                logger.info("Closing Arena gRPC channel")
-                channel.close()
-                time.sleep(5)  # 避免短时间内重复创建 Arena 连接
-    finally:
-        if shared_tongsim is not None:
-            try:
-                logger.info("Closing shared TongSim connection after {} runs", runtimes)
-                shared_tongsim.close()
-            except Exception as exc:  # pragma: no cover - 进程退出时尽力清理
-                logger.warning("Failed to close shared TongSim connection: {}", exc)
+    if completed < runtimes:
+        logger.error(
+            "Completed only {}/{} requested runs after {} attempts",
+            completed,
+            runtimes,
+            attempts,
+        )
 
 
 if __name__ == "__main__":
