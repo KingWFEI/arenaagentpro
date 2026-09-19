@@ -240,6 +240,112 @@ class JigsawTransferTests(unittest.TestCase):
         self.assertIn(layout.target_rotation["yaw"], rotations)
         self.assertGreater(abs(layout.target_rotation["yaw"]), 170.0)
 
+    def test_legacy_placement_can_match_current_board_rotation(self) -> None:
+        class FakeAgent:
+            character_id = "character"
+            semantic_mapper = object()
+
+        for obj in self.objects:
+            obj["rotation"] = {"roll": 0.0, "pitch": 0.0, "yaw": 110.0}
+        agent = FakeAgent()
+        agent.tongsim = FakeLegacyTongSim(self.objects)
+        mapping = [
+            {"object_id": "7", "cell": "top-right"},
+            {"object_id": "8", "cell": "middle-left"},
+            {"object_id": "9", "cell": "bottom-middle"},
+        ]
+        with (
+            patch("arenaagent.preliminary_baseline_agent.tasks.jigsaw.runner.solve_by_image_cost", return_value=mapping),
+            patch.dict("os.environ", {"JIGSAW_TARGET_YAW": "observed"}),
+        ):
+            run_dedicated_jigsaw(agent, self.subject)
+
+        placed = [call for call in agent.tongsim.calls if call[0] == "legacy_place"]
+        self.assertEqual(len(placed), 3)
+        self.assertTrue(all(call[3]["target_rotation"].yaw == 110.0 for call in placed))
+
+    def test_target_yaw_override_supports_evaluator_ab_test(self) -> None:
+        for obj in self.objects:
+            obj["rotation"] = {"roll": 0.0, "pitch": 0.0, "yaw": 110.0}
+
+        class FakeAgent:
+            character_id = "character"
+            semantic_mapper = FakeMapper()
+
+        agent = FakeAgent()
+        agent.tongsim = FakeLegacyTongSim(self.objects)
+        with (
+            patch(
+                "arenaagent.preliminary_baseline_agent.tasks.jigsaw.runner.solve_by_image_cost",
+                return_value=[
+                    {"object_id": "7", "cell": "top-right"},
+                    {"object_id": "8", "cell": "middle-left"},
+                    {"object_id": "9", "cell": "bottom-middle"},
+                ],
+            ),
+            patch.dict("os.environ", {"JIGSAW_TARGET_YAW": "90"}),
+        ):
+            run_dedicated_jigsaw(agent, self.subject)
+
+        placed = [call for call in agent.tongsim.calls if call[0] == "legacy_place"]
+        self.assertEqual(len(placed), 3)
+        self.assertTrue(all(call[3]["target_rotation"].yaw == 90.0 for call in placed))
+
+    def test_plans_all_cells_and_in_plane_angles_before_first_pickup(self) -> None:
+        # Make the distinctive top-middle cell empty, and give it a 90-degree
+        # image quarter-turn.  The other candidates retain their input order.
+        self.objects[1] = _tile(2, 30, 30)
+        self.objects[7]["rotation"] = {"roll": 0, "pitch": 180, "yaw": 0}
+        self.objects[8]["rotation"] = {"roll": 0, "pitch": 90, "yaw": 0}
+
+        class FakeAgent:
+            character_id = "character"
+            semantic_mapper = object()
+
+        agent = FakeAgent()
+        agent.tongsim = FakeLegacyTongSim(self.objects)
+        mapping = [
+            {"object_id": "7", "cell": "bottom-middle", "image_rotation_degrees": 0},
+            {"object_id": "8", "cell": "middle-left", "image_rotation_degrees": 180},
+            {"object_id": "9", "cell": "top-middle", "image_rotation_degrees": 90},
+        ]
+
+        def inspect_planning(image, layout):
+            self.assertFalse(any(call[0] == "take" for call in agent.tongsim.calls))
+            return mapping
+
+        with (
+            patch("arenaagent.preliminary_baseline_agent.tasks.jigsaw.runner.solve_by_image_cost", side_effect=inspect_planning),
+            patch.dict("os.environ", {"JIGSAW_TARGET_YAW": "90", "JIGSAW_IMAGE_ROTATION_SIGN": "1"}),
+        ):
+            run_dedicated_jigsaw(agent, self.subject)
+
+        placed = [call for call in agent.tongsim.calls if call[0] == "legacy_place"]
+        self.assertEqual([call[1] for call in placed], ["9", "7", "8"])
+        self.assertEqual([call[3]["target_rotation"].pitch for call in placed], [90.0, 0.0, -180.0])
+        self.assertTrue(all(call[3]["target_rotation"].roll == 0.0 for call in placed))
+        self.assertTrue(all(call[3]["target_rotation"].yaw == 90.0 for call in placed))
+
+    def test_matching_initial_pose_does_not_erase_texture_quarter_turn(self) -> None:
+        class FakeAgent:
+            character_id = "character"
+            semantic_mapper = object()
+
+        for obj in self.objects:
+            obj["rotation"] = {"roll": 0.0, "pitch": 0.0, "yaw": 79.0}
+        agent = FakeAgent()
+        agent.tongsim = FakeLegacyTongSim(self.objects)
+        mapping = [
+            {"object_id": "7", "cell": "top-right", "image_rotation_degrees": 90},
+            {"object_id": "8", "cell": "middle-left", "image_rotation_degrees": 180},
+            {"object_id": "9", "cell": "bottom-middle", "image_rotation_degrees": 270},
+        ]
+        with patch("arenaagent.preliminary_baseline_agent.tasks.jigsaw.runner.solve_by_image_cost", return_value=mapping):
+            run_dedicated_jigsaw(agent, self.subject)
+
+        placed = [call for call in agent.tongsim.calls if call[0] == "legacy_place"]
+        self.assertEqual([call[3]["target_rotation"].pitch for call in placed], [90.0, -180.0, -90.0])
+
     def test_image_cost_matches_three_distinct_reference_colors(self) -> None:
         layout = infer_layout(self.objects, self.subject["reference_bounding"])
         clean = np.full((720, 640, 3), 225, dtype=np.uint8)

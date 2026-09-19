@@ -4,11 +4,13 @@ import base64
 import itertools
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from statistics import median
 from typing import Any
 
 import cv2
 import numpy as np
+from loguru import logger
 
 
 @dataclass(frozen=True)
@@ -240,6 +242,35 @@ def build_vlm_montage(image_b64: str, layout: JigsawLayout) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(encoded.tobytes()).decode("ascii")
 
 
+def save_diagnostic_montage(
+    image_b64: str,
+    layout: JigsawLayout,
+    destination: str | Path,
+) -> Path:
+    """Save the focused, labelled scene locally for post-run failure analysis."""
+    output = Path(destination)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    montage_b64 = build_vlm_montage(image_b64, layout)
+    output.write_bytes(base64.b64decode(montage_b64.split(",", 1)[1]))
+    return output
+
+
+def save_perception_snapshot(image_b64: str, destination: str | Path) -> Path:
+    """Save the clean-camera half of a combined legacy perception frame."""
+    output = Path(destination)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    combined = _decode_combined_image(image_b64)
+    clean = combined[:, : combined.shape[1] // 2]
+    extension = output.suffix.lower() if output.suffix else ".png"
+    ok, encoded = cv2.imencode(extension, clean)
+    if not ok:
+        raise ValueError(f"could not save jigsaw perception snapshot: {output}")
+    # cv2.imwrite cannot reliably open Unicode Windows paths.  Encoding in
+    # memory and writing through pathlib is Unicode-safe.
+    output.write_bytes(encoded.tobytes())
+    return output
+
+
 def build_mapping_prompt(layout: JigsawLayout) -> str:
     candidate_ids = [str(candidate["object_id"]) for candidate in layout.candidates]
     cells = [
@@ -286,8 +317,8 @@ def parse_mapping(response_text: str, layout: JigsawLayout) -> list[dict[str, st
     return normalized
 
 
-def solve_by_image_cost(image_b64: str, layout: JigsawLayout) -> list[dict[str, str]]:
-    """Offline fallback: globally minimize LAB/edge mismatch over all one-to-one assignments."""
+def solve_by_image_cost(image_b64: str, layout: JigsawLayout) -> list[dict[str, Any]]:
+    """Jointly solve each candidate's destination cell and in-plane angle."""
     combined = _decode_combined_image(image_b64)
     clean = combined[:, : combined.shape[1] // 2]
     reference = _reference_crop(clean)
@@ -295,7 +326,11 @@ def solve_by_image_cost(image_b64: str, layout: JigsawLayout) -> list[dict[str, 
     y_edges = np.rint(np.linspace(0, reference.shape[0], 4)).astype(int)
     candidates = list(layout.candidates)
     cells = list(layout.empty_cells)
-    costs = np.zeros((len(candidates), len(cells)), dtype=np.float64)
+    angle_options = (0, 90, 180, 270)
+    angle_costs = np.zeros(
+        (len(candidates), len(cells), len(angle_options)),
+        dtype=np.float64,
+    )
 
     for candidate_index, candidate in enumerate(candidates):
         tile = _candidate_crop(clean, candidate, wide=True)
@@ -304,25 +339,82 @@ def solve_by_image_cost(image_b64: str, layout: JigsawLayout) -> list[dict[str, 
                 y_edges[cell.row] : y_edges[cell.row + 1],
                 x_edges[cell.column] : x_edges[cell.column + 1],
             ]
-            resized = cv2.resize(tile, (target.shape[1], target.shape[0]), interpolation=cv2.INTER_CUBIC)
-            tile_lab = cv2.cvtColor(resized, cv2.COLOR_BGR2LAB).astype(np.float32)
             target_lab = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype(np.float32)
-            color_cost = np.mean(
-                (cv2.GaussianBlur(tile_lab, (5, 5), 0) - cv2.GaussianBlur(target_lab, (5, 5), 0)) ** 2
-            )
-            tile_gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
             target_gray = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
-            edge_cost = np.mean(
-                (cv2.Sobel(tile_gray, cv2.CV_32F, 1, 1) - cv2.Sobel(target_gray, cv2.CV_32F, 1, 1)) ** 2
-            )
-            costs[candidate_index, cell_index] = float(color_cost + 0.2 * edge_cost)
+            for angle_index, _ in enumerate(angle_options):
+                oriented = np.rot90(tile, angle_index).copy()
+                resized = cv2.resize(
+                    oriented,
+                    (target.shape[1], target.shape[0]),
+                    interpolation=cv2.INTER_CUBIC,
+                )
+                tile_lab = cv2.cvtColor(resized, cv2.COLOR_BGR2LAB).astype(np.float32)
+                color_cost = np.mean(
+                    (
+                        cv2.GaussianBlur(tile_lab, (5, 5), 0)
+                        - cv2.GaussianBlur(target_lab, (5, 5), 0)
+                    )
+                    ** 2
+                )
+                tile_gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+                edge_cost = np.mean(
+                    (
+                        cv2.Sobel(tile_gray, cv2.CV_32F, 1, 1)
+                        - cv2.Sobel(target_gray, cv2.CV_32F, 1, 1)
+                    )
+                    ** 2
+                )
+                angle_costs[candidate_index, cell_index, angle_index] = float(
+                    color_cost + 0.2 * edge_cost
+                )
 
-    assignment = min(
-        itertools.permutations(range(len(cells))),
-        key=lambda permutation: sum(costs[index, permutation[index]] for index in range(len(candidates))),
+    costs = angle_costs.min(axis=2)
+    best_angle_indices = angle_costs.argmin(axis=2)
+
+    ranked_assignments = sorted(
+        (
+            (
+                float(sum(costs[index, permutation[index]] for index in range(len(candidates)))),
+                permutation,
+            )
+            for permutation in itertools.permutations(range(len(cells)))
+        ),
+        key=lambda item: item[0],
+    )
+    assignment = ranked_assignments[0][1]
+    candidate_ids = [str(candidate["object_id"]) for candidate in candidates]
+    cell_names = [cell.name for cell in cells]
+    logger.info(
+        "Jigsaw image-cost matrix: candidate_ids={} cells={} costs={}",
+        candidate_ids,
+        cell_names,
+        np.round(costs, 2).tolist(),
+    )
+    logger.info(
+        "Jigsaw assignment ranking: {}",
+        [
+            {
+                "score": round(score, 2),
+                "mapping": {
+                    candidate_ids[index]: {
+                        "cell": cell_names[permutation[index]],
+                        "image_rotation_degrees": angle_options[
+                            int(best_angle_indices[index, permutation[index]])
+                        ],
+                    }
+                    for index in range(len(candidates))
+                },
+            }
+            for score, permutation in ranked_assignments
+        ],
     )
     return [
-        {"object_id": str(candidate["object_id"]), "cell": cells[assignment[index]].name}
+        {
+            "object_id": str(candidate["object_id"]),
+            "cell": cells[assignment[index]].name,
+            "image_rotation_degrees": angle_options[
+                int(best_angle_indices[index, assignment[index]])
+            ],
+        }
         for index, candidate in enumerate(candidates)
     ]
-
