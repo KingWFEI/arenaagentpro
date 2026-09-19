@@ -259,23 +259,38 @@ def main() -> None:
         logger.error("run_times must be at least 1")
         return
 
-    for _ in range(runtimes):
-        channel = _create_channel(grpc_target)
-        stub = TongTestAgentServiceStub(channel)
-        time.sleep(2)  # 等待连接稳定
-        agent = None
-        try:
-            agent = builder.build(args.agent_name, stub=stub, channel=channel)
-            agent.load(params)
-            agent.run()
-        except Exception as e:
-            logger.opt(exception=True).warning("error trace back {}", e)
-            _release_agent_quietly(agent)
-            continue
-        finally:
-            logger.info("Closing gRPC channel")
-            channel.close()
-            time.sleep(5)  # 避免短时间内重复创建连接导致的问题
+    shared_tongsim = None
+    try:
+        for _ in range(runtimes):
+            channel = _create_channel(grpc_target)
+            stub = TongTestAgentServiceStub(channel)
+            time.sleep(2)  # 等待连接稳定
+            agent = None
+            try:
+                agent = builder.build(args.agent_name, stub=stub, channel=channel)
+                configure_shared_tongsim = getattr(agent, "configure_shared_tongsim", None)
+                if runtimes > 1 and callable(configure_shared_tongsim):
+                    configure_shared_tongsim(shared_tongsim)
+
+                agent.load(params)
+                if runtimes > 1 and shared_tongsim is None:
+                    shared_tongsim = getattr(agent, "tongsim", None)
+                agent.run()
+            except Exception as e:
+                logger.opt(exception=True).warning("error trace back {}", e)
+                _release_agent_quietly(agent)
+                continue
+            finally:
+                logger.info("Closing Arena gRPC channel")
+                channel.close()
+                time.sleep(5)  # 避免短时间内重复创建 Arena 连接
+    finally:
+        if shared_tongsim is not None:
+            try:
+                logger.info("Closing shared TongSim connection after {} runs", runtimes)
+                shared_tongsim.close()
+            except Exception as exc:  # pragma: no cover - 进程退出时尽力清理
+                logger.warning("Failed to close shared TongSim connection: {}", exc)
 
 
 if __name__ == "__main__":

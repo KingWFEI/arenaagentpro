@@ -57,7 +57,7 @@ include-package-data = false
 py-modules = []
 
 [tool.setuptools.package-data]
-"arenaagent.preliminary_baseline_agent" = ["prompts/*.json", "tasks/*/prompt.txt"]
+"arenaagent.preliminary_baseline_agent" = ["prompts/*.json", "tasks/*/*.txt"]
 "arenaagent.vlm_agent" = ["prompts/*.txt", "prompts/*.json", "skills/*.txt"]
 
 [tool.setuptools.packages.find]

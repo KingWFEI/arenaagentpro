@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-import unittest
 import json
 import tempfile
-import threading
-import time
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
+from arenaagent.agent_base import summarize_subject_for_log
 from arenaagent.preliminary_baseline_agent.preliminary_baseline_agent import PreliminaryBaselineAgent
 from arenaagent.preliminary_baseline_agent.task_runtime import TaskContext
-from arenaagent.preliminary_baseline_agent.tasks.raven.rules import induce_rules
 from arenaagent.preliminary_baseline_agent.tasks.raven.ensemble import combine_question
 from arenaagent.preliminary_baseline_agent.tasks.raven.experience import (
     record_successful_subject,
@@ -23,6 +21,7 @@ from arenaagent.preliminary_baseline_agent.tasks.raven.reasoners import (
     ask_text_verifier,
     ask_visual_reasoner,
 )
+from arenaagent.preliminary_baseline_agent.tasks.raven.rules import RuleInductionResult, induce_rules
 from arenaagent.preliminary_baseline_agent.tasks.raven.solver import (
     HybridRavenSolver,
     restore_prior_model_votes,
@@ -34,12 +33,15 @@ from arenaagent.preliminary_baseline_agent.tasks.raven.text_client import (
 )
 from arenaagent.preliminary_baseline_agent.tasks.raven.verifier import (
     ModelVote,
+    parse_direct_model_votes,
     parse_model_votes,
     parse_single_model_vote,
     sanitize_ranked_triples,
 )
 from arenaagent.preliminary_baseline_agent.tasks.raven.vision import extract_question_observations
-from arenaagent.agent_base import summarize_subject_for_log
+from arenaagent.preliminary_baseline_agent.tasks.raven.vision_client import (
+    build_raven_vision_client_from_env,
+)
 from arenaagent.vlm_agent.raven_skill import group_image_to_raven_list, handle
 
 
@@ -219,6 +221,15 @@ class RavenRuleEngineTests(unittest.TestCase):
 
 
 class RavenVerifierTests(unittest.TestCase):
+    def test_whole_image_direct_answers_accept_label_digits_and_json_list(self) -> None:
+        for response in ("答案：5,8,2", "582", "[5, 8, 2]"):
+            votes = parse_direct_model_votes(response)
+            self.assertEqual([vote.answer for vote in votes], [5, 8, 2])
+            self.assertTrue(all(vote.confidence == 0.9 for vote in votes))
+
+    def test_whole_image_direct_answers_do_not_guess_from_explanatory_numbers(self) -> None:
+        self.assertEqual(parse_direct_model_votes("第1题可能是5，第2题可能是8。"), [])
+
     def test_eight_way_distribution_overrides_inconsistent_declared_answer(self) -> None:
         candidates = [
             {"id": index, "confidence": 0.65 if index == 6 else 0.05, "mismatch": []}
@@ -296,6 +307,94 @@ class RavenRoutingTests(unittest.TestCase):
 
 
 class RavenRuntimeSafetyTests(unittest.TestCase):
+    def test_raven_vision_client_uses_non_thinking_k3_with_short_timeout(self) -> None:
+        sentinel = object()
+        environment = {
+            "RAVEN_ENABLE_VLM": "1",
+            "RAVEN_VLM_MODEL": "",
+            "RAVEN_VLM_API_BASE": "",
+            "RAVEN_VLM_API_KEY": "",
+            "RAVEN_VLM_TIMEOUT_SECONDS": "",
+            "VLM_CLIENT_CFG_API_KEY": "test-only-key",
+        }
+        with patch.dict("os.environ", environment, clear=False), patch(
+            "arenaagent.preliminary_baseline_agent.aux_client.ClientFactory.build",
+            return_value=sentinel,
+        ) as build:
+            client = build_raven_vision_client_from_env()
+
+        self.assertIs(client, sentinel)
+        client_type, cfg = build.call_args.args
+        self.assertEqual(client_type, "openai")
+        self.assertEqual(cfg.name, "kimi-k3")
+        self.assertEqual(cfg.request_timeout_seconds, 30.0)
+        self.assertEqual(
+            cfg.chat_completion_kwargs,
+            {
+                "extra_body": {"thinking": {"type": "disabled"}},
+                "max_tokens": 256,
+            },
+        )
+
+    def test_solve_raven_local_action_does_not_require_tongsim(self) -> None:
+        agent = PreliminaryBaselineAgent(stub=None, channel=None)
+        agent.tongsim = None
+        agent.character_id = None
+        expected = {"answer": [5, 8, 2]}
+
+        with patch.object(agent, "_handle_solve_raven", return_value=expected) as solve:
+            result = agent._do_action({"action": "solve_raven", "parameters": {}})
+
+        self.assertEqual(result, expected)
+        solve.assert_called_once()
+
+    def test_raven_init_prefetch_skips_tongsim_character_spawn(self) -> None:
+        agent = PreliminaryBaselineAgent(stub=None, channel=None)
+        spawn_info = {
+            "name": "raven-agent",
+            "spawn_loc": "[0, 0, 0]",
+            "spawn_rot": "[0, 0, 0]",
+        }
+        raven_subject = {"task_type": "raven", "task_data": "encoded-image"}
+
+        with patch.object(agent, "_get_subject_from_task", return_value=raven_subject), patch(
+            "arenaagent.vlm_agent.vlm_agent.ClientFactory.build", return_value=object()
+        ), patch(
+            "arenaagent.vlm_agent.vlm_agent.TongSimGrpcClient"
+        ) as tongsim_client:
+            agent.init(spawn_info)
+
+        tongsim_client.assert_not_called()
+        self.assertIsNone(agent.character_id)
+        self.assertIsNone(agent.semantic_mapper)
+        self.assertEqual(agent._prefetched_subject, raven_subject)
+
+    def test_non_raven_init_still_spawns_tongsim_character(self) -> None:
+        agent = PreliminaryBaselineAgent(stub=None, channel=None)
+        spawn_info = {
+            "name": "counting-agent",
+            "spawn_loc": "[1, 2, 3]",
+            "spawn_rot": "[0, 0, 90]",
+        }
+        fake_tongsim = SimpleNamespace(spawn_character=lambda *args: "character-1")
+
+        with patch.object(
+            agent,
+            "_get_subject_from_task",
+            return_value={"task_type": "counting"},
+        ), patch(
+            "arenaagent.vlm_agent.vlm_agent.ClientFactory.build", return_value=object()
+        ), patch(
+            "arenaagent.vlm_agent.vlm_agent.TongSimGrpcClient",
+            return_value=fake_tongsim,
+        ), patch(
+            "arenaagent.vlm_agent.vlm_agent.SemanticMapper", return_value=object()
+        ):
+            agent.init(spawn_info)
+
+        self.assertEqual(agent.character_id, "character-1")
+        self.assertIsNotNone(agent.semantic_mapper)
+
     def test_deepseek_v4_pro_is_built_as_independent_text_client(self) -> None:
         sentinel = object()
         environment = {
@@ -363,50 +462,45 @@ class RavenRuntimeSafetyTests(unittest.TestCase):
         self.assertNotIn('"marker": "q1"', content)
         self.assertNotIn("image_url", content)
 
-    def test_three_questions_are_sent_as_parallel_grounded_requests(self) -> None:
+    def test_three_questions_use_one_original_image_and_one_direct_k3_answer(self) -> None:
         class FakeClient:
             def __init__(self) -> None:
-                self.lock = threading.Lock()
-                self.active = 0
-                self.max_active = 0
                 self.messages: list[list[dict]] = []
 
             def invoke(self, message, max_retries=2):
                 del max_retries
-                with self.lock:
-                    self.active += 1
-                    self.max_active = max(self.max_active, self.active)
-                    self.messages.append(message[0]["content"])
-                prompt = message[0]["content"][0]["text"]
-                question = int(prompt.split("QUESTION_NUMBER=", 1)[1].split(".", 1)[0])
-                time.sleep(0.04)
-                with self.lock:
-                    self.active -= 1
-                candidates = [
-                    {"id": index, "confidence": 0.65 if index == question else 0.05, "mismatch": []}
-                    for index in range(1, 9)
-                ]
-                return SimpleNamespace(
-                    text=json.dumps(
-                        {
-                            "question": question,
-                            "answer": question,
-                            "candidates": candidates,
-                            "rule": "auditable rule",
-                            "evidence": ["image and CV agree"],
-                        }
-                    )
-                )
+                self.messages.append(message[0]["content"])
+                return SimpleNamespace(text="答案：1,2,3")
 
         client = FakeClient()
         groups = [[Image.new("L", (32, 32), "white") for _ in range(16)] for _ in range(3)]
         summaries = [{"question": index, "cv_marker": f"summary-{index}"} for index in range(1, 4)]
-        votes, _ = ask_visual_reasoner(client, groups, summaries)
+        whole_image = Image.new("RGB", (320, 160), "white")
+        votes, _ = ask_visual_reasoner(client, groups, summaries, whole_image=whole_image)
         self.assertEqual([vote.answer for vote in votes], [1, 2, 3])
-        self.assertEqual(len(client.messages), 3)
-        self.assertGreaterEqual(client.max_active, 2)
-        self.assertTrue(all(sum(item["type"] == "image_url" for item in content) == 1 for content in client.messages))
-        self.assertTrue(all("STRUCTURED_EVIDENCE=" in content[0]["text"] for content in client.messages))
+        self.assertEqual(len(client.messages), 1)
+        self.assertEqual(sum(item["type"] == "image_url" for item in client.messages[0]), 1)
+        self.assertIn("结构化属性分析", client.messages[0][0]["text"])
+        self.assertNotIn("STRUCTURED_EVIDENCE=", client.messages[0][0]["text"])
+        self.assertIn("答案：X,X,X", client.messages[0][0]["text"])
+
+    def test_missing_original_canvas_never_falls_back_to_split_question_images(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def invoke(self, message, max_retries=1):
+                del message, max_retries
+                self.calls += 1
+                return SimpleNamespace(text="答案：1,2,3")
+
+        client = FakeClient()
+        groups = [[Image.new("L", (32, 32), "white") for _ in range(16)] for _ in range(3)]
+        summaries = [{"question": index} for index in range(1, 4)]
+        votes, raw = ask_visual_reasoner(client, groups, summaries)
+        self.assertEqual(votes, [])
+        self.assertEqual(raw, "")
+        self.assertEqual(client.calls, 0)
 
     def test_conflicting_second_question_is_selected_for_targeted_revision(self) -> None:
         attempt = {
@@ -454,6 +548,44 @@ class RavenRuntimeSafetyTests(unittest.TestCase):
         solver = HybridRavenSolver(vlm_client=visual_client)
         self.assertIsNone(solver.text_client)
 
+    def test_missing_visual_response_preserves_legacy_first_choice(self) -> None:
+        groups = [[Image.new("L", (32, 32), "white") for _ in range(16)] for _ in range(3)]
+        with patch(
+            "arenaagent.preliminary_baseline_agent.tasks.raven.solver.ask_visual_reasoner",
+            return_value=([], "quota exceeded"),
+        ):
+            result = HybridRavenSolver(vlm_client=object()).solve(
+                groups,
+                legacy_ranked=[[5, 8, 2], [8, 8, 2]],
+            )
+        self.assertEqual(result.selected_answers, [5, 8, 2])
+        self.assertTrue(result.diagnostics["visual_fallback_to_legacy"])
+
+    def test_initial_visual_override_requires_rule_agreement_and_high_confidence(self) -> None:
+        groups = [[Image.new("L", (32, 32), "white") for _ in range(16)] for _ in range(3)]
+        votes = [
+            ModelVote(question=1, answer=8, confidence=0.82),
+            ModelVote(question=2, answer=6, confidence=0.88),
+            ModelVote(question=3, answer=6, confidence=0.85),
+        ]
+        with patch(
+            "arenaagent.preliminary_baseline_agent.tasks.raven.solver.ask_visual_reasoner",
+            return_value=(votes, "{}"),
+        ), patch(
+            "arenaagent.preliminary_baseline_agent.tasks.raven.solver.induce_rules"
+        ) as induce:
+            induce.side_effect = [
+                RuleInductionResult([0, 0, 0, 0, 0, 0, 0, 1], 0.8, []),
+                RuleInductionResult([0, 0, 0, 0, 0, 1, 0, 0], 0.8, []),
+                RuleInductionResult([0, 0, 0, 0, 0, 1, 0, 0], 0.8, []),
+            ]
+            result = HybridRavenSolver(vlm_client=object()).solve(
+                groups,
+                legacy_ranked=[[5, 5, 5]],
+            )
+        self.assertEqual(result.selected_answers, [5, 6, 6])
+        self.assertEqual(result.diagnostics["conservative_legacy_restores"][0]["question"], 1)
+
     def test_raven_subject_index_uses_available_rpc(self) -> None:
         agent = PreliminaryBaselineAgent(stub=None, channel=None)
         with patch.object(
@@ -470,7 +602,7 @@ class RavenRuntimeSafetyTests(unittest.TestCase):
         self.assertNotIn(payload, str(summary))
         self.assertIn("image/base64", summary["task_data"])
 
-    def test_raven_uses_fast_path_then_escalates_without_faking_completion(self) -> None:
+    def test_raven_uses_hybrid_reasoning_on_first_attempt_without_faking_completion(self) -> None:
         class FakeAgent:
             subject_finished = False
             action_space = {"key": "answer"}
@@ -493,9 +625,11 @@ class RavenRuntimeSafetyTests(unittest.TestCase):
         ) as hybrid:
             first = handle(agent, {"structure": []}, {})
             second = handle(agent, {"structure": []}, {})
-        self.assertEqual(first, {"answer": [2, 2, 6]})
-        self.assertEqual(second, {"answer": [3, 2, 8]})
-        hybrid.assert_called_once()
+        self.assertEqual(first, {"answer": [3, 2, 8]})
+        self.assertEqual(second.get("result"), "failed")
+        self.assertEqual(hybrid.call_count, 2)
+        self.assertEqual(hybrid.call_args_list[0].kwargs["rejected_answers"], [])
+        self.assertEqual(hybrid.call_args_list[1].kwargs["rejected_answers"], [[3, 2, 8]])
         self.assertFalse(agent.subject_finished)
 
     def test_rejected_reasoned_answer_triggers_fresh_revision_not_next_enumeration(self) -> None:
@@ -516,7 +650,7 @@ class RavenRuntimeSafetyTests(unittest.TestCase):
             "arenaagent.vlm_agent.raven_skill.get_raven_legacy_candidates", return_value=[[3, 5, 5]]
         ), patch(
             "arenaagent.vlm_agent.raven_skill.get_raven_ranked_candidates",
-            side_effect=[[[3, 1, 7]], [[3, 6, 6]]],
+            side_effect=[[[3, 5, 5]], [[3, 1, 7]], [[3, 6, 6]]],
         ) as reasoner:
             first = handle(agent, {}, {})
             second = handle(agent, {}, {})
@@ -524,7 +658,7 @@ class RavenRuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(first, {"answer": [3, 5, 5]})
         self.assertEqual(second, {"answer": [3, 1, 7]})
         self.assertEqual(third, {"answer": [3, 6, 6]})
-        self.assertEqual(reasoner.call_count, 2)
+        self.assertEqual(reasoner.call_count, 3)
         self.assertIn([3, 1, 7], reasoner.call_args.kwargs["rejected_answers"])
 
     def test_runtime_refuses_second_ranked_combination_when_top_is_rejected(self) -> None:
@@ -545,7 +679,7 @@ class RavenRuntimeSafetyTests(unittest.TestCase):
             "arenaagent.vlm_agent.raven_skill.get_raven_legacy_candidates", return_value=[[3, 5, 5]]
         ), patch(
             "arenaagent.vlm_agent.raven_skill.get_raven_ranked_candidates",
-            return_value=[[3, 5, 5], [3, 6, 6]],
+            side_effect=[[[3, 5, 5]], [[3, 5, 5], [3, 6, 6]]],
         ):
             first = handle(agent, {}, {})
             second = handle(agent, {}, {})

@@ -6,9 +6,9 @@ from arenaagent.preliminary_baseline_agent.tasks.base import action_succeeded
 
 
 class RoomScanner:
-    """无可执行计划时用 45 度小步探索；信息齐全时允许提前结束。"""
+    """可选的视角扫描器；整理房间默认传入 0 以禁用启动转向。"""
 
-    def __init__(self, turns_required: int = 8, turn_degrees: int = 45) -> None:
+    def __init__(self, turns_required: int = 3, turn_degrees: int = 90) -> None:
         self.turns_required = turns_required
         self.turn_degrees = turn_degrees
         self.turns_completed = 0

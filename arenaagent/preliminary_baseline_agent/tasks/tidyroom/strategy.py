@@ -21,22 +21,17 @@ class TidyRoomStrategy(TaskStrategy):
 
     task_type = "tidyroom"
     history_message_limit = 0
-    _MAX_VERIFICATION_WAITS = 1
-    _FAILURES_BEFORE_DEFER = 2
-    # 完成一圈机会式扫描后，若仍有目标缺失，只允许半圈补充搜索。
-    # 角色移动后的观察会持续并入世界模型，不必再次原地转完整一圈。
-    _MAX_LOCAL_SEARCH_TURNS = 4
+    # 当前方案锁定出生朝向：缺目标或目的地时也不原地转向。
+    _MAX_LOCAL_SEARCH_TURNS = 0
     _LOCAL_SEARCH_DEGREES = 45
     # 目的地在这局房间里根本不存在时（模型把物品认成"鞋子"但屋里没有鞋架），
     # 转满几轮就该放弃这类目标，否则会把整道题的时间全耗在转圈上。
     _MAX_MISSING_DESTINATION_ROUNDS = 2
-    _TRASH_SETTLE_OBSERVATIONS = 1
-    _MAX_OFFICIAL_CONTAINER_ATTEMPTS = 2
-    _MAX_PLACEMENT_VERIFICATION_FAILURES = 3
-    _CONTAINER_NUDGE_DISTANCE = 15.0
-    # 训练阶段验证：这些承载面使用相同的已验证落点，但跳过人物先走到
-    # 家具旁的动作。若动作或几何校验失败，会自动恢复传统靠近后放置。
-    _DIRECT_FORCE_PLACE_DESTINATIONS = frozenset({"dining_table"})
+    # 新版 912 由客户端把坐标放置回退到 put_down_sth(force_locate=True)；
+    # 四类目的地都不会改变人物所在位置，调度器据此计算拾取顺序。
+    _DIRECT_FORCE_PLACE_DESTINATIONS: frozenset[str] = frozenset(
+        {"sofa", "dining_table", "trash_bin", "shoe_storage"}
+    )
 
     def reset(self, subject: dict[str, Any]) -> None:
         super().reset(subject)
@@ -46,7 +41,8 @@ class TidyRoomStrategy(TaskStrategy):
         self.targets = self.world.targets
         self.scene_anchors = self.world.scene_anchors
         self.planner = TidyRoomPlanner()
-        self.scanner = RoomScanner()
+        # 初始正向 120° 视野已经覆盖本题主要物品和目的地；不再为了盘点转向。
+        self.scanner = RoomScanner(turns_required=0, turn_degrees=90)
         self.scheduler = TargetScheduler()
         self.verifier = TidyRoomVerifier()
         self.recovery = RecoveryPolicy(vlm_threshold=3)
@@ -54,9 +50,6 @@ class TidyRoomStrategy(TaskStrategy):
         self.held_raw_id: str | None = None
         self.active_plan: dict[str, Any] | None = None
         self.awaiting_pick_raw_id: str | None = None
-        self.awaiting_verification_raw_id: str | None = None
-        self.verification_waits = 0
-        self.placement_settle_waits = 0
         self.local_search_turns = 0
         self.local_search_reason: str | None = None
         self.local_search_signature: tuple[Any, ...] | None = None
@@ -65,23 +58,17 @@ class TidyRoomStrategy(TaskStrategy):
         self.successful_puts = 0
         self.failed_actions = 0
         self.pickup_verification_failures = 0
-        self.placement_verification_failures = 0
         self.local_action_count = 0
         self.vlm_call_count = 0
         self.vlm_reason: str | None = None
+        # 保留字段仅为兼容旧的状态输出；单帧流程永远不再启动第二视角诊断。
         self._second_frame_vlm_pending = False
         self._survey_done = False
 
     def survey_is_due(self) -> bool:
-        """扫完一圈、手里还没有任何目标时，做一次全屋多图标注。
-
-        912 不下发目标清单，逐帧问模型会得到互相矛盾的标签；这里在勘测结束时
-        一次性问全，之后执行阶段不再需要模型。
-        """
+        """初始正向分割稳定后，做一次单图语义盘点。"""
         return bool(
-            not self.world.targets_declared_by_task
-            and self.scanner.complete
-            and not self.world.targets
+            self.scanner.complete
             and not self._survey_done
         )
 
@@ -91,10 +78,7 @@ class TidyRoomStrategy(TaskStrategy):
     def observe(self, context: TaskContext) -> None:
         super().observe(context)
         self.world.observe(context)
-        # 规划器保存跨视角的物体和地板信息，角色转身后数据不会丢失。
-        self.planner.observe(list(self.world.scene_objects.values()))
         self._reconcile_pick_state(self._object_in_hand_raw_id(context.object_in_hand))
-        self._verify_pending_placement(context)
         if not self.scanner.complete and self._scan_requirements_met():
             self.scanner.finish_early("all_targets_and_required_destinations_mapped")
             logger.info(
@@ -115,14 +99,12 @@ class TidyRoomStrategy(TaskStrategy):
         return tuple(raw_id for raw_id in dict.fromkeys(raw_ids) if raw_id)
 
     def refresh_raw_ids(self) -> tuple[str, ...]:
-        """只刷新会影响当前动作校验的目标，家具几何沿用扫描阶段缓存。"""
+        """只刷新当前动作相关的目标，家具几何沿用扫描阶段缓存。"""
         raw_ids: list[str] = []
         if self.awaiting_pick_raw_id is not None:
             raw_ids.append(self.awaiting_pick_raw_id)
         if self.held_raw_id is not None:
             raw_ids.append(self.held_raw_id)
-        if self.awaiting_verification_raw_id is not None:
-            raw_ids.append(self.awaiting_verification_raw_id)
         if self.active_plan is not None:
             raw_ids.extend(
                 [
@@ -141,21 +123,8 @@ class TidyRoomStrategy(TaskStrategy):
         self._request_vlm(reason)
 
     def should_force_second_frame_vlm(self) -> bool:
-        """首帧未形成组合并转向后，第二帧必须完整采集并咨询一次 VLM。
-
-        前提是任务系统已经下发了目标清单——模型可以拿清单去比对自己看到的
-        画面。912 不再下发清单，此时扫描才刚开始，模型没有可对照的物品，问
-        它只会得到"继续转"这类无用回答（实测单次 70~130 秒）。这种情况留给
-        扫描覆盖全屋之后的 local_plan_unavailable 一次性补充语义。
-        """
-        return bool(
-            self._second_frame_vlm_pending
-            and self.step_index >= 2
-            and self.vlm_call_count == 0
-            # 必须是任务系统下发的清单；勘测发现的目标不算，否则全屋标注之后
-            # 又会被这个条件触发一次多余的诊断。
-            and self.world.targets_declared_by_task
-        )
+        """单帧流程不会再为第二视角强制调用 VLM。"""
+        return False
 
     def next_local_action(self, context: TaskContext) -> dict[str, Any] | None:
         del context
@@ -165,12 +134,6 @@ class TidyRoomStrategy(TaskStrategy):
         if active_action is not None:
             self.vlm_reason = None
             return active_action
-
-        # 首帧没有可执行组合时已经转过 45 度。第二帧跳过本地短路，强制把
-        # 当前同一帧的结构化信息、RGB 和分割图交给 VLM 一次。
-        if self.should_force_second_frame_vlm():
-            self._second_frame_vlm_pending = False
-            return self._request_vlm("second_scene_diagnostic")
 
         active_raw_id = self._active_raw_id()
         self.vlm_reason = self.vlm_policy.reason(
@@ -189,22 +152,8 @@ class TidyRoomStrategy(TaskStrategy):
             self.vlm_reason = None
             return pick_action
 
-        # 首帧只使用一次结构化感知。无论结果为空，还是没有形成“待整理目标
-        # + 对应目的地”的可执行组合，都立即转向 45 度；VLM 固定延后到转向
-        # 后的第二帧，避免首帧分割缓存尚未就绪时浪费一次视觉调用。
-        if self.step_index == 1:
-            self._second_frame_vlm_pending = True
-            scan_action = self.scanner.next_action()
-            if scan_action is None:
-                scan_action = self._turn_action(
-                    self.scanner.turn_degrees,
-                    "首帧没有形成可执行组合，转向 45 度后进入第二帧完整视觉诊断。",
-                )
-            return self._count_local(scan_action)
-
-        # 扫描不再是开始任务前必须完成的阻塞阶段。当前视野没有形成
-        # “目标 + 对应家具”的可执行计划时，才转 45 度补充一次视野；
-        # 每次移动、抓取和放置后的新观察仍会持续并入同一个世界模型。
+        # 初始扫描器在单帧模式中已完成，因此这里不会产生启动转向。
+        # 保留通用分支，仅为兼容外部实验显式换入非零扫描器的情况。
         scan_action = self.scanner.next_action()
         if scan_action is not None:
             self.vlm_reason = None
@@ -240,16 +189,6 @@ class TidyRoomStrategy(TaskStrategy):
         if self._all_targets_settled():
             return self._count_local(self._submit_action())
 
-        if self.awaiting_verification_raw_id is not None:
-            return self._count_local(
-                {
-                    "action": "turn_in_degree",
-                    "parameters": {"degree": 0},
-                    "output": 0,
-                    "think": "等待物理系统稳定并刷新目标物全局 AABB。",
-                }
-            )
-
         if self.held_raw_id is not None:
             if self.recovery.needs_vlm(self.held_raw_id):
                 # 已持物也不能无限绕过失败阈值；把控制权交回升级策略一次。
@@ -262,6 +201,15 @@ class TidyRoomStrategy(TaskStrategy):
 
     def _next_pick_action(self) -> dict[str, Any] | None:
         """选择一个当前结构化数据足以处理的目标。"""
+        # 调度器只会返回“已有目的地 anchor”的目标。原先几何候选提升写在
+        # _ensure_plan 中，导致没有 anchor 时调度器先返回 None，_ensure_plan
+        # 永远进不去，几何回退成为死路径。餐桌可由“大桌面 + 邻近 chair”
+        # 稳定识别，因此必须在调度之前先提升候选。
+        for candidate_raw_id in self.world.pending_raw_ids():
+            destination_type = self.world.destination_type_for(
+                self.targets[candidate_raw_id]
+            )
+            self._promote_safe_geometric_destination(destination_type)
         raw_id = self._retry_or_schedule_target()
         if raw_id is None:
             return None
@@ -280,31 +228,18 @@ class TidyRoomStrategy(TaskStrategy):
         name = str(action.get("action") or "").lower()
         parameters = action.get("parameters") or {}
         consulted_reason = self.vlm_reason
-        self.world.apply_semantic_hints(parameters, context)
         # 模型顺带标注的其余物品与家具也一并收下，避免为每一件再往返一次。
         # 它有时写在 parameters 里，有时写在动作顶层，两处都收。
         self.world.apply_scene_annotations(
             parameters.get("scene_annotations") or action.get("scene_annotations"),
             context,
         )
+        # 先登记 scene_annotations 中独立确认的家具，再处理当前物品引用的
+        # destination_object_id；这样单个物品条目不能凭空创造目的地。
+        self.world.apply_semantic_hints(parameters, context)
         requested_id = str(parameters.get("object_id") or "")
         self.recovery.mark_vlm_consulted(self._active_raw_id())
         self.vlm_reason = None
-        if name == "turn_in_degree" and consulted_reason == "second_scene_diagnostic":
-            # 第二帧 VLM 只决定“是否需要换方向”，扫描角度仍由本地扫描器统一
-            # 管理。否则模型返回 15° 等任意角度时，after_action 会把它误计为
-            # 一次完整的 45° 扫描，最终形成视野缺口。
-            original_degree = parameters.get("degree")
-            if original_degree != self.scanner.turn_degrees:
-                action = deepcopy(action)
-                parameters = dict(parameters)
-                parameters["degree"] = self.scanner.turn_degrees
-                action["parameters"] = parameters
-                action["think"] = (
-                    f"{str(action.get('think') or '').strip()} "
-                    f"第二帧搜索转向由本地扫描器规范为 {self.scanner.turn_degrees}°"
-                    f"（VLM 原始角度：{original_degree}°）。"
-                ).strip()
         if name == "turn_in_degree" and self._is_local_search_reason(consulted_reason):
             # VLM 在结构化搜索耗尽后通常只会建议换个方向观察。执行这一次
             # 建议后重新给本地搜索一轮预算，避免下一帧再次请求 VLM。
@@ -343,11 +278,12 @@ class TidyRoomStrategy(TaskStrategy):
     def after_action(self, action: dict[str, Any], result: Any, context: TaskContext | None) -> None:
         name = str(action.get("action") or "").lower()
         if name == "turn_in_degree":
-            if not self.scanner.complete:
+            degree = int((action.get("parameters") or {}).get("degree", 0))
+            if not self.scanner.complete and degree == self.scanner.turn_degrees:
                 self.scanner.after_action(result)
             elif (
                 self.local_search_reason is not None
-                and int((action.get("parameters") or {}).get("degree", 0)) == self._LOCAL_SEARCH_DEGREES
+                and degree == self._LOCAL_SEARCH_DEGREES
             ):
                 # 搜索转向无论成功与否都消耗一次预算，防止动作接口失败时
                 # 在同一个方向永久循环。
@@ -356,15 +292,12 @@ class TidyRoomStrategy(TaskStrategy):
         if name == "move_and_take_object":
             self._after_take(action, result, context)
             return
-        if name in {"move_to_location", "move_to_object", "move_forward"} and self._after_placement_approach(result):
-            return
         if name in {
             "move_and_put_down",
             "put_down_to_location",
             "put_down_sth_to_location",
-            "move_and_put_down_object_in_container",
         }:
-            self._after_put(action, result)
+            self._after_put(result)
 
     def state_for_prompt(self) -> dict[str, Any]:
         plan_for_prompt = None
@@ -380,10 +313,9 @@ class TidyRoomStrategy(TaskStrategy):
             "unfinished_count": self.world.unfinished_count(),
             "held_target_object_id": self.targets.get(self.held_raw_id, {}).get("object_id"),
             "successful_takes": self.successful_takes,
-            "successful_verified_puts": self.successful_puts,
+            "successful_puts": self.successful_puts,
             "failed_actions": self.failed_actions,
             "pickup_verification_failures": self.pickup_verification_failures,
-            "placement_verification_failures": self.placement_verification_failures,
             "local_action_count": self.local_action_count,
             "vlm_call_count": self.vlm_call_count,
             "vlm_reason": self.vlm_reason,
@@ -413,27 +345,35 @@ class TidyRoomStrategy(TaskStrategy):
         destination_type = self.world.destination_type_for(target)
         if destination_type is None:
             return None
-        self.active_plan = self.planner.build_plan(
+        plan = self.planner.build_plan(
             raw_id=raw_id,
             target=target,
             destination_type=destination_type,
             anchors=self.scene_anchors,
             slot_index=self._used_destination_slots(destination_type),
         )
+        if plan is None and self.world.promote_geometric_candidate(destination_type) is not None:
+            # 这一类目的地没有可信标注：模型没标出来，或者标出来的家具已经被
+            # 落点高度证伪。直接按几何挑一件，用下一次落点证伪比再问一次模型
+            # 快得多——模型每轮要 20 秒，而且经常把同一件错家具再标一遍。
+            plan = self.planner.build_plan(
+                raw_id=raw_id,
+                target=target,
+                destination_type=destination_type,
+                anchors=self.scene_anchors,
+                slot_index=self._used_destination_slots(destination_type),
+            )
+        self.active_plan = plan
         if self.active_plan is not None:
             # 目标被暂时延后再选中时，继续沿用累计失败序号，避免重建计划后
             # 又从同一个接近点和同一个放置槽位开始。
             self.active_plan["attempt"] = self.recovery.total_failures.get(raw_id, 0)
-            self.active_plan["direct_force_place_disabled"] = bool(
-                target.get("direct_force_place_disabled", False)
-            )
             self.planner.refresh_plan(self.active_plan, self.scene_anchors)
             logger.info(
-                "Tidy-room local plan target={} destination={} anchor={} move={} put={} support_z={}",
+                "Tidy-room local plan target={} destination={} anchor={} put={} support_z={}",
                 target.get("object_id"),
                 destination_type,
                 self.active_plan.get("destination_object_id"),
-                self.active_plan.get("move_target_location"),
                 self.active_plan.get("put_target_location"),
                 self.active_plan.get("support_z"),
             )
@@ -445,8 +385,20 @@ class TidyRoomStrategy(TaskStrategy):
         if not action_succeeded(result):
             self.failed_actions += 1
             if raw_id in self.targets:
-                self.targets[raw_id]["status"] = "pending"
-                self.recovery.record_failure(raw_id, "pickup_action_failed", self.active_plan)
+                error = str(result.get("error") or "") if isinstance(result, dict) else ""
+                if "not pickup" in error.lower():
+                    # 新版服务端用该错误明确表示这是环境装饰/建筑，不是可拾取
+                    # 刚体。继续重试或再问视觉模型都不会改变服务端属性。
+                    self.targets[raw_id]["status"] = "blocked"
+                    self.targets[raw_id]["blocked_reason"] = "server_not_pickup"
+                    logger.warning(
+                        "Tidy-room blocks non-pickup object={} after authoritative server rejection",
+                        requested_id,
+                    )
+                    self.active_plan = None
+                else:
+                    self.targets[raw_id]["status"] = "pending"
+                    self.recovery.record_failure(raw_id, "pickup_action_failed", self.active_plan)
             self.awaiting_pick_raw_id = None
             return
         if raw_id is not None:
@@ -455,57 +407,28 @@ class TidyRoomStrategy(TaskStrategy):
             self.targets[raw_id]["status"] = "pickup_check"
             self.awaiting_pick_raw_id = raw_id
 
-    def _after_put(self, action: dict[str, Any], result: Any) -> None:
+    def _after_put(self, result: Any) -> None:
         if self.active_plan is None:
             return
         raw_id = str(self.active_plan["target_raw_id"])
-        direct_force_place = bool(self.active_plan.pop("direct_force_place_in_flight", False))
         if not action_succeeded(result):
             self.failed_actions += 1
-            action_name = str(action.get("action") or "")
             error = str(result.get("error") or "") if isinstance(result, dict) else ""
             failure_reason = "placement_action_failed"
-            if action_name == "move_and_put_down_object_in_container":
-                failure_reason = "container_not_found" if "no container found" in error.lower() else failure_reason
-                attempts = int(self.active_plan.get("official_container_attempts", 0)) + 1
-                self.active_plan["official_container_attempts"] = attempts
-                if attempts >= self._MAX_OFFICIAL_CONTAINER_ATTEMPTS:
-                    # 专用接口无法识别这个垃圾桶时立即切换精确落点，不能再
-                    # 围绕垃圾桶循环移动。
-                    self.active_plan["container_coordinate_fallback"] = True
-                    self.active_plan["placement_approached"] = True
-                    logger.warning(
-                        "Tidy-room container API failed {} times for target={}; use coordinate fallback",
-                        attempts,
-                        self.targets[raw_id].get("object_id"),
-                    )
-                else:
-                    self.active_plan["placement_approached"] = False
-            else:
-                self.active_plan["placement_approached"] = False
-                if direct_force_place:
-                    # 直接放置不受支持时只试一次，随后恢复“先靠近再放置”。
-                    self.active_plan["direct_force_place_disabled"] = True
-                    self.targets[raw_id]["direct_force_place_disabled"] = True
             self.recovery.record_failure(raw_id, failure_reason, self.active_plan, {"error": error})
             self.planner.refresh_plan(self.active_plan, self.scene_anchors)
             return
         if self.held_raw_id is None:
             return
-        if not direct_force_place:
-            self.scheduler.mark_at_destination(self.active_plan)
-        self.targets[raw_id]["status"] = "placement_check"
-        self.awaiting_verification_raw_id = raw_id
+        # put_down_sth_to_location 是把物品强制放到指定坐标：动作返回 success
+        # 就说明它已经在该落点上，不再回读 AABB 做几何校验。省下的这一步在
+        # 400 秒里很值钱，也避免读到放置前的旧坐标而把放好的物品反复重放。
         self.awaiting_pick_raw_id = None
         self.held_raw_id = None
-        self.verification_waits = 0
-        self.placement_settle_waits = 0
-        parameters = action.get("parameters") or {}
-        self.active_plan["last_put_location"] = deepcopy(
-            parameters.get("put_target_location") or parameters.get("target_location") or {}
+        self._finish_placement(
+            raw_id,
+            log="Tidy-room placement done target={} destination={} (coordinate force place)",
         )
-        self.active_plan["last_put_action"] = str(action.get("action") or "")
-        self.active_plan["last_put_was_direct"] = direct_force_place
 
     def _reconcile_pick_state(self, observed_hand_raw_id: str | None) -> None:
         if self.awaiting_pick_raw_id is not None:
@@ -533,99 +456,21 @@ class TidyRoomStrategy(TaskStrategy):
                 self.successful_takes += 1
             self.held_raw_id = observed_hand_raw_id
             self.targets[observed_hand_raw_id]["status"] = "held"
-        elif self.held_raw_id is not None and self.awaiting_verification_raw_id is None:
+        elif self.held_raw_id is not None:
             lost_raw_id = self.held_raw_id
             self.held_raw_id = None
             self.targets[lost_raw_id]["status"] = "pending"
             self.recovery.record_failure(lost_raw_id, "object_lost_before_placement", self.active_plan)
 
-    def _verify_pending_placement(self, context: TaskContext) -> None:
-        raw_id = self.awaiting_verification_raw_id
-        if raw_id is None or self.active_plan is None:
-            return
-        if (
-            self.active_plan.get("destination_type") == "trash_bin"
-            and self.placement_settle_waits < self._TRASH_SETTLE_OBSERVATIONS
-        ):
-            # 官方容器动作会启用物理模拟。至少跨过一个本地循环再读取 AABB，
-            # 避免在罐子仍处于下落过程时误判成功或失败。
-            self.placement_settle_waits += 1
-            return
-        target_aabb = context.world_aabbs_by_raw_id.get(raw_id)
-        destination_raw_id = str(self.active_plan["destination_raw_id"])
-        destination_aabb = context.world_aabbs_by_raw_id.get(destination_raw_id)
-        if not target_aabb and self.targets.get(raw_id, {}).get("visible"):
-            target_aabb = self.targets.get(raw_id, {}).get("object_info", {}).get("world_aabb")
-        if not destination_aabb:
-            destination_aabb = self.active_plan.get("destination_info", {}).get("world_aabb")
-        check = self.verifier.verify_placement(target_aabb, destination_aabb, self.active_plan)
-        if check["reason"] == "missing_aabb":
-            self.verification_waits += 1
-            if self.verification_waits <= self._MAX_VERIFICATION_WAITS:
-                return
-        self.awaiting_verification_raw_id = None
-        self.verification_waits = 0
-        self.placement_settle_waits = 0
-        if check["valid"]:
-            self.targets[raw_id]["status"] = "done"
-            self.targets[raw_id]["verified_destination"] = self.active_plan["destination_type"]
-            self.successful_puts += 1
-            self.recovery.record_success(raw_id)
-            logger.info(
-                "Tidy-room placement verified target={} destination={} geometry={}",
-                self.targets[raw_id].get("object_id"),
-                self.active_plan["destination_type"],
-                check,
-            )
-            self.active_plan = None
-            return
-        self.targets[raw_id]["status"] = "pending"
-        self.targets[raw_id]["placement_verification_failures"] = (
-            int(self.targets[raw_id].get("placement_verification_failures", 0)) + 1
-        )
-        self.placement_verification_failures += 1
-        self.recovery.record_failure(raw_id, str(check["reason"]), self.active_plan, check)
-        self.active_plan["placement_approached"] = False
-        if self.active_plan.get("last_put_was_direct", False):
-            # 动作虽然返回成功，但官方几何状态不正确时也关闭快速路径。
-            self.active_plan["direct_force_place_disabled"] = True
-            self.targets[raw_id]["direct_force_place_disabled"] = True
-        self.planner.refresh_plan(self.active_plan, self.scene_anchors)
-        logger.warning(
-            "Tidy-room placement invalid target={} destination={} action={} reason={} "
-            "actual_center={} destination_aabb={} next_move={} next_put={}",
-            self.targets[raw_id].get("object_id"),
-            self.active_plan.get("destination_type"),
-            self.active_plan.get("last_put_action"),
-            check.get("reason"),
-            check.get("actual_center"),
-            check.get("destination_aabb"),
-            self.active_plan.get("move_target_location"),
-            self.active_plan.get("put_target_location"),
-        )
-        target_placement_failures = int(
-            self.targets[raw_id].get("placement_verification_failures", 0)
-        )
-        if target_placement_failures >= self._MAX_PLACEMENT_VERIFICATION_FAILURES:
-            # 坐标纠正仍连续失败时停止重新抓放。保留 blocked 状态让最终提交
-            # 体现真实完成度，避免一个异常物体耗尽 64 步或反复调用 VLM。
-            self.targets[raw_id]["status"] = "blocked"
-            logger.error(
-                "Tidy-room blocks target={} after {} placement verification failures",
-                self.targets[raw_id].get("object_id"),
-                target_placement_failures,
-            )
-            self.active_plan = None
-        elif self.recovery.consecutive_failures.get(raw_id, 0) >= self._FAILURES_BEFORE_DEFER:
-            # 已释放的物体连续两次没有落入有效区域时，先让调度器选择其他
-            # 物体。失败次数仍被保留；若之后再次选择它，会换接近方向和槽位。
-            # 这样一个滚落物体不会耗尽整场比赛时间。
-            logger.warning(
-                "Tidy-room defers repeatedly failed target={} failures={}",
-                self.targets[raw_id].get("object_id"),
-                self.recovery.consecutive_failures.get(raw_id, 0),
-            )
-            self.active_plan = None
+    def _finish_placement(self, raw_id: str, log: str) -> None:
+        """收尾一次放置：目标标记完成、计数、清掉活动计划。"""
+        destination_type = str((self.active_plan or {}).get("destination_type") or "")
+        self.targets[raw_id]["status"] = "done"
+        self.targets[raw_id]["verified_destination"] = destination_type
+        self.successful_puts += 1
+        self.recovery.record_success(raw_id)
+        logger.info(log, self.targets[raw_id].get("object_id"), destination_type)
+        self.active_plan = None
 
     def _retry_or_schedule_target(self) -> str | None:
         if self.active_plan is not None:
@@ -730,6 +575,12 @@ class TidyRoomStrategy(TaskStrategy):
         全耗在转圈上。转满若干轮就放弃这类目标，让调度器去做别的或者提交。
         """
         destination_type = reason.partition(":")[2]
+        # 仍有可靠的纯几何候选时不允许把整类真实目标直接 blocked。尤其是
+        # 初始模型把茶几/扶手椅当餐桌时，首帧缓存中的真餐桌仍可由邻近椅子
+        # 找回，不能因为两轮 VLM 都标错就提前提交 done=0。
+        if self._promote_safe_geometric_destination(destination_type):
+            self._missing_destination_rounds[destination_type] = 0
+            return
         rounds = self._missing_destination_rounds.get(destination_type, 0) + 1
         self._missing_destination_rounds[destination_type] = rounds
         if rounds < self._MAX_MISSING_DESTINATION_ROUNDS:
@@ -748,6 +599,16 @@ class TidyRoomStrategy(TaskStrategy):
                 destination_type,
             )
 
+    def _promote_safe_geometric_destination(self, destination_type: str | None) -> bool:
+        """为具有强几何证据的目的地补建 anchor；目前仅自动恢复餐桌。"""
+        if not destination_type:
+            return False
+        if self.world.has_destination(destination_type):
+            return True
+        if destination_type != "dining_table":
+            return False
+        return self.world.promote_geometric_candidate(destination_type) is not None
+
     def _local_search_signature(self, reason: str) -> tuple[Any, ...]:
         mapped_targets = sum(record.get("object_id") is not None for record in self.targets.values())
         destination_types = tuple(sorted(str(anchor.get("type") or "") for anchor in self.scene_anchors.values()))
@@ -761,27 +622,6 @@ class TidyRoomStrategy(TaskStrategy):
         self.local_search_turns = 0
         self.local_search_reason = None
         self.local_search_signature = None
-
-    def _after_placement_approach(self, result: Any) -> bool:
-        """记录携物靠近目的地的动作，下一步再执行可靠坐标放置。"""
-        plan = self.active_plan
-        if plan is None or self.held_raw_id is None:
-            return False
-        raw_id = str(plan["target_raw_id"])
-        if action_succeeded(result):
-            plan["placement_approached"] = True
-        else:
-            self.failed_actions += 1
-            plan["placement_approached"] = False
-            self.recovery.record_failure(raw_id, "placement_approach_failed", plan)
-            if (
-                plan.get("destination_type") == "trash_bin"
-                and self.recovery.consecutive_failures.get(raw_id, 0) >= self._MAX_OFFICIAL_CONTAINER_ATTEMPTS
-            ):
-                plan["container_coordinate_fallback"] = True
-                plan["placement_approached"] = True
-            self.planner.refresh_plan(plan, self.scene_anchors)
-        return True
 
     def _request_vlm(self, reason: str) -> None:
         """记录一次即将发生的真实 VLM 请求，并把控制权交回公共运行时。"""
@@ -812,90 +652,18 @@ class TidyRoomStrategy(TaskStrategy):
     def _put_action(self, plan: dict[str, Any], reason: str) -> dict[str, Any]:
         self.planner.refresh_plan(plan, self.scene_anchors)
         destination_type = str(plan.get("destination_type") or "目的地")
-        if destination_type == "trash_bin" and plan.get("container_coordinate_fallback", False):
-            return {
-                "action": "put_down_to_location",
-                "parameters": {
-                    "target_location": deepcopy(plan["put_target_location"]),
-                    "which_hand": 0,
-                    "auto_rotate": True,
-                    "force_release": True,
-                    "disable_physics": False,
-                    "hold_if_unreachable": False,
-                    "force_locate": True,
-                },
-                "output": 0,
-                "think": "容器接口两次未识别垃圾桶，停止绕行并回退到桶内精确落点。",
-            }
-        direct_force_place = (
-            destination_type in self._DIRECT_FORCE_PLACE_DESTINATIONS
-            and not plan.get("direct_force_place_disabled", False)
-        )
-        if direct_force_place:
-            plan["direct_force_place_attempted"] = True
-            plan["direct_force_place_in_flight"] = True
-            return {
-                "action": "put_down_to_location",
-                "parameters": {
-                    "target_location": deepcopy(plan["put_target_location"]),
-                    "which_hand": 0,
-                    "auto_rotate": True,
-                    "force_release": True,
-                    "disable_physics": True,
-                    "hold_if_unreachable": False,
-                    "force_locate": True,
-                },
-                "output": 0,
-                "think": f"训练加速：保持 {destination_type} 的已验证落点，直接精确放置并在下一帧校验。",
-            }
-        if not plan.get("placement_approached", False):
-            if destination_type == "trash_bin":
-                official_attempts = int(plan.get("official_container_attempts", 0))
-                if official_attempts == 0:
-                    return {
-                        "action": "move_to_object",
-                        "parameters": {"object_id": str(plan["destination_object_id"])},
-                        "output": 0,
-                        "think": "让仿真导航直接靠近垃圾桶的有效交互距离。",
-                    }
-                return {
-                    "action": "move_forward",
-                    "parameters": {"distance": self._CONTAINER_NUDGE_DISTANCE},
-                    "output": 0,
-                    "think": "容器接口首次未识别垃圾桶，仅向前微调 15 厘米后重试。",
-                }
-            return {
-                "action": "move_to_location",
-                "parameters": {
-                    "target_location": deepcopy(plan["move_target_location"]),
-                    "stop_distance": 5.0,
-                },
-                "output": 0,
-                "think": f"{reason} 先携物移动到 {destination_type} 的可达侧。",
-            }
-        if destination_type == "trash_bin":
-            # 正常路径使用仿真提供的官方“放入容器”动作，让赛题侧建立真实
-            # 的容器关系。精确坐标放置只保留给桌面和沙发。
-            return {
-                "action": "move_and_put_down_object_in_container",
-                "parameters": {"which_hand": 0},
-                "output": 0,
-                "think": "已到达垃圾桶可操作侧，使用官方容器动作放入垃圾并等待物理落底。",
-            }
-        # 桌面和沙发仍使用本地规划的精确落点，并冻结以防圆形食物滚落。
+        # 912 新版的家具坐标先验已提供精确落点；统一使用 force_locate，人物
+        # 不需要先走到家具旁边，也不会触发旧版容器接口或导航回退。
         return {
-            "action": "put_down_to_location",
+            "action": "put_down_sth_to_location",
             "parameters": {
                 "target_location": deepcopy(plan["put_target_location"]),
                 "which_hand": 0,
                 "auto_rotate": True,
-                "force_release": True,
-                "disable_physics": True,
-                "hold_if_unreachable": False,
                 "force_locate": True,
             },
             "output": 0,
-            "think": f"已靠近 {destination_type}，执行可验证的精确放置。",
+            "think": f"{reason} 按规划落点直接放置到 {destination_type}。",
         }
 
     @staticmethod
@@ -913,5 +681,5 @@ class TidyRoomStrategy(TaskStrategy):
             "action": "submit_answer",
             "parameters": {},
             "output": 0,
-            "think": "全部目标均已通过结构化放置校验，提交任务。",
+            "think": "当前所有可执行目标均已处理或被服务端判定不可处理，提交任务。",
         }

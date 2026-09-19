@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from typing import Any
 
@@ -21,15 +22,15 @@ from arenaagent.preliminary_baseline_agent.tasks.counting.runtime import run_cou
 from arenaagent.preliminary_baseline_agent.tasks.jigsaw.runner import run_dedicated_jigsaw
 from arenaagent.preliminary_baseline_agent.tasks.npc.runner import run_npc_fast_step
 from arenaagent.preliminary_baseline_agent.tasks.npc.strategy import NpcStrategy
-from arenaagent.preliminary_baseline_agent.tasks.npc.text_client import (
-    build_npc_text_client_from_env,
-)
-from arenaagent.preliminary_baseline_agent.tasks.raven.text_client import (
-    build_raven_text_client_from_env,
-)
 from arenaagent.preliminary_baseline_agent.tasks.tidyroom.survey import run_scene_survey
 from arenaagent.preliminary_baseline_agent.tasks.tidyroom.vlm_client import (
     build_tidyroom_vision_client_from_env,
+)
+from arenaagent.preliminary_baseline_agent.tasks.raven.vision_client import (
+    build_raven_vision_client_from_env,
+)
+from arenaagent.preliminary_baseline_agent.tasks.raven.local_dataset import (
+    collect_labeled_raven_subject,
 )
 from arenaagent.utils.configclass import configclass
 from arenaagent.vlm_agent.raven_skill import record_confirmed_raven_experience
@@ -60,13 +61,17 @@ class PreliminaryBaselineAgent(VLMAgent):
     """Shared VLM runtime with isolated strategy state for each preliminary task."""
 
     _TIDYROOM_MAX_LOCAL_STEPS = 64
-    _NPC_MAX_LOCAL_STEPS = 6
-    _TIDYROOM_POST_TURN_SETTLE_SECONDS = 0.25
-    _TIDYROOM_POST_TURN_MAX_ATTEMPTS = 5
+    _NPC_MAX_LOCAL_STEPS = 8
+    _TIDYROOM_POST_TURN_SETTLE_SECONDS = 0.75
+    _TIDYROOM_POST_TURN_MAX_ATTEMPTS = 10
+    # 不再用固定数量门槛：鞋柜等视角本来就只看得见几件物品。未就绪帧由
+    # 分割图非黑、非 RGB 副本，以及对象 ID 连续两帧一致来排除。
+    _TIDYROOM_MIN_UNIFIED_OBJECTS = 1
     _TIDYROOM_SEGMENTATION_GAP_RATIO = 0.20
     _TIDYROOM_SEGMENTATION_MIN_GAP = 3
     _TIDYROOM_MIN_MAPPED_PIXEL_COVERAGE = 0.50
-    _TIDYROOM_SURVEY_MAX_FRAMES = 8
+    # 新版任务的初始正向视野已经覆盖主要物品和目的地，只保留这一帧。
+    _TIDYROOM_SURVEY_MAX_FRAMES = 1
 
     def __init__(
         self,
@@ -91,6 +96,7 @@ class PreliminaryBaselineAgent(VLMAgent):
         self._spawn_yaw: float | None = None
         self._tidyroom_post_turn_diagnostic_sequence = 0
         self._tidyroom_post_turn_perception_blocked = False
+        self._tidyroom_retake_missing_frame = False
         self._tidyroom_survey_frames: list[str] = []
         self.raven_text_client = None
         self._raven_text_client_initialized = False
@@ -101,10 +107,33 @@ class PreliminaryBaselineAgent(VLMAgent):
         self.tidyroom_vlm_client = None
         self._tidyroom_vlm_client_initialized = False
         self._jigsaw_attempt_subject_key: tuple[str, str] | None = None
+        self._prefetched_subject: dict[str, Any] | None = None
+        self._skip_tongsim_character_init = False
 
     def init(self, opt: dict[str, Any]) -> None:
-        """保存赛题服务下发的真实出生坐标，供整理房间路线规划使用。"""
+        """预取题型并保存真实出生坐标，避免瑞文创建无用的 3D 角色。"""
+        try:
+            prefetched = self._get_subject_from_task()
+        except Exception as exc:
+            logger.debug("Could not prefetch subject before runtime initialization: {}", exc)
+            prefetched = {}
+        if isinstance(prefetched, dict) and prefetched:
+            self._prefetched_subject = prefetched
+            self._skip_tongsim_character_init = normalize_task_type(prefetched) == "raven"
+        if self._skip_tongsim_character_init:
+            # Bound the correction path as well as the fast path. The Moonshot
+            # account used by the 912 runtime only permits one in-flight request.
+            try:
+                visual_timeout = max(float(os.getenv("RAVEN_VISUAL_TIMEOUT_SECONDS", "20")), 1.0)
+            except ValueError:
+                visual_timeout = 20.0
+            self.cfg.vlm_config.client_cfg.request_timeout_seconds = visual_timeout
+            self.cfg.vlm_config.client_cfg.native_max_retries = 0
         super().init(opt)
+        if self._skip_tongsim_character_init:
+            # Raven uses a task-specific K3 whole-image client with thinking
+            # disabled so one three-question request stays inside the score budget.
+            self.vlm_client = build_raven_vision_client_from_env() or self.vlm_client
         raw_location = opt.get("spawn_loc")
         try:
             location = json.loads(raw_location) if isinstance(raw_location, str) else raw_location
@@ -135,7 +164,8 @@ class PreliminaryBaselineAgent(VLMAgent):
 
     def _run_subject(self) -> None:
         """整理房间使用本地快速循环，其他四类任务保持原有服务循环。"""
-        subject = self._get_subject_from_task()
+        subject = self._prefetched_subject or self._get_subject_from_task()
+        self._prefetched_subject = None
         task_type = normalize_task_type(subject)
         if task_type == "counting":
             run_counting_subject(self, subject)
@@ -187,6 +217,7 @@ class PreliminaryBaselineAgent(VLMAgent):
         self.subject_finished = False
 
         final_actions = {"submit_answer", "finish_task"}
+        accepted_final_answer = False
 
         logger.info(
             "Using NPC fast loop (max_steps={})",
@@ -205,10 +236,23 @@ class PreliminaryBaselineAgent(VLMAgent):
                 action_name,
             )
 
-                    # 最终答案只在这里向 Arena 上报一次。
+            # 最终答案只在这里向 Arena 上报一次。
             if action_name in final_actions:
-                self._apply_action(action_result)
+                apply_response = self._apply_action(action_result)
+                if apply_response.get("answer_right") is False:
+                    answer_key = str(getattr(self, "action_space", {}).get("key") or "answer")
+                    rejected_answer = str(action_result.get(answer_key) or "").strip()
+                    strategy = self._task_strategy
+                    if isinstance(strategy, NpcStrategy):
+                        strategy.note_rejected_answer(rejected_answer)
+                    self.subject_finished = False
+                    logger.warning(
+                        "NPC answer '{}' was rejected by Arena; retrying with remaining candidates",
+                        rejected_answer,
+                    )
+                    continue
                 self.subject_finished = True
+                accepted_final_answer = True
                 logger.info(
                     "NPC fast loop finished with final action {}",
                     action_name,
@@ -234,14 +278,21 @@ class PreliminaryBaselineAgent(VLMAgent):
                 self._NPC_MAX_LOCAL_STEPS,
             )
 
-        self._evaluate_subject()
+        if accepted_final_answer:
+            self._evaluate_subject()
+        else:
+            logger.error("NPC fast loop ended without an answer accepted by Arena")
 
     def _run_raven_subject_safely(self, first_subject: dict[str, Any]) -> None:
-        """Discard a slow answer if the server moved to the next Raven subject.
+        """Submit exactly once, while discarding work for a subject that already changed.
 
         A remote vision call cannot be cancelled once it is in flight.  The
         server may force-evaluate the old subject meanwhile; submitting its
         result afterwards would otherwise apply that answer to the new image.
+
+        The black-box Raven task accepts only one final answer.  Train mode may
+        leave a wrong subject marked RUNNING, but that must not be interpreted
+        as permission to launch a second K3/DeepSeek correction round.
         """
         subject: dict[str, Any] = first_subject
         while not self._current_subject_finished():
@@ -271,15 +322,17 @@ class PreliminaryBaselineAgent(VLMAgent):
                 self.subject_finished = False
                 subject = self._get_subject_from_task()
                 continue
-            self._apply_action(action)
-            if self.subject_finished:
-                logger.info("Raven subject finished by agent action.")
-                break
-            if self.sleep_between_steps > 0:
-                time.sleep(self.sleep_between_steps)
-            subject = self._get_subject_from_task()
+            apply_response = self._apply_action(action)
+            logger.info(
+                "Raven one-shot answer submitted for subject index {}; requesting evaluation without retry "
+                "(response={})",
+                subject_index_before,
+                apply_response,
+            )
+            break
 
         evaluation = self._evaluate_subject()
+        collect_labeled_raven_subject(self, evaluation)
         record_confirmed_raven_experience(self, evaluation)
 
     def _raven_current_subject_index(self) -> int:
@@ -293,17 +346,15 @@ class PreliminaryBaselineAgent(VLMAgent):
 
     def _ensure_task_strategy(self, subject: Any) -> TaskStrategy:
         task_type = normalize_task_type(subject)
-        if task_type == "raven" and not self._raven_text_client_initialized:
-            self.raven_text_client = build_raven_text_client_from_env()
-            self._raven_text_client_initialized = True
-        if task_type == "npc" and not self._npc_text_client_initialized:
-            self.npc_text_client = build_npc_text_client_from_env()
-            self._npc_text_client_initialized = True
         if task_type == "counting" and not self._counting_review_client_initialized:
             self.counting_review_client = build_counting_review_client_from_env()
             self._counting_review_client_initialized = True
         if task_type == "tidyroom" and not self._tidyroom_vlm_client_initialized:
-            self.tidyroom_vlm_client = build_tidyroom_vision_client_from_env()
+            # 整理房间只做一次高价值单图盘点，使用独立的高速多模态模型；
+            # 其余赛题继续沿用启动参数选择的主模型。
+            self.tidyroom_vlm_client = build_tidyroom_vision_client_from_env() or self.vlm_client
+            if self.tidyroom_vlm_client is self.vlm_client:
+                logger.warning("Tidy-room fast vision client unavailable; falling back to primary client")
             self._tidyroom_vlm_client_initialized = True
         safe_subject = dict(subject) if isinstance(subject, dict) else {"subject": str(subject)}
         identity = str(
@@ -346,18 +397,24 @@ class PreliminaryBaselineAgent(VLMAgent):
         self._last_executed_action_name = ""
         self._tidyroom_post_turn_diagnostic_sequence = 0
         self._tidyroom_post_turn_perception_blocked = False
+        self._tidyroom_retake_missing_frame = False
         self._tidyroom_survey_frames: list[str] = []
 
     def _remember_survey_frame(self, image_b64: str | None) -> None:
-        """留一份扫描期的画面，供扫完整圈后一次性标注使用。
-
-        模型只认它看得见的东西，一帧一帧问会让同一件家具在不同帧里得到互相
-        矛盾的标签；攒齐一圈一起发，它才能给出全局一致的那份。
-        """
+        """保留分割稳定后的初始正向画面，供单图盘点使用。"""
         if not image_b64:
             return
         self._tidyroom_survey_frames.append(image_b64)
         del self._tidyroom_survey_frames[: -self._TIDYROOM_SURVEY_MAX_FRAMES]
+
+    def _tidyroom_survey_is_ready(self, strategy: TaskStrategy) -> bool:
+        """初始正向画面到齐后立即允许盘点。"""
+        required_frames = getattr(strategy.scanner, "turns_required", 0) + 1
+        return bool(
+            self._active_task_type == "tidyroom"
+            and strategy.survey_is_due()
+            and len(self._tidyroom_survey_frames) >= required_frames
+        )
 
     def run_step(self, subject: Any, task_response: dict[str, Any]) -> dict[str, Any]:
         strategy = self._ensure_task_strategy(subject)
@@ -379,10 +436,6 @@ class PreliminaryBaselineAgent(VLMAgent):
                     {"think": "拼图专用求解器完成三块拼图的放置。", "output": 0},
                 )
 
-        if self._active_task_type == "tidyroom" and strategy.survey_is_due():
-            strategy.note_survey_attempted()
-            run_scene_survey(strategy, self)
-
         previous_tail = self._action_histories[-1] if self._action_histories else None
         action_result = super().run_step(subject, task_response)
         if self._action_histories and self._action_histories[-1] is not previous_tail:
@@ -400,18 +453,30 @@ class PreliminaryBaselineAgent(VLMAgent):
         **kwargs: Any,
     ) -> tuple[str | None, list[dict[str, Any]], list[dict[str, Any]]]:
         """转向后只接受分割区域与可见对象映射基本一致的完整感知。"""
+        is_tidyroom = normalize_task_type(subject) == "tidyroom"
         is_post_turn_full_capture = bool(
-            normalize_task_type(subject) == "tidyroom"
+            is_tidyroom
             and self._last_executed_action_name == "turn_in_degree"
             and kwargs.get("include_images", True)
         )
-        if not is_post_turn_full_capture:
+        is_initial_912_survey_capture = bool(
+            is_tidyroom
+            and kwargs.get("include_images", True)
+            and self._task_strategy is not None
+            and self._task_strategy.scanner.turns_completed == 0
+            and not self._tidyroom_survey_frames
+            and not is_post_turn_full_capture
+        )
+        if not (is_post_turn_full_capture or is_initial_912_survey_capture):
             return super()._acquire_camera_perception(subject, **kwargs)
 
-        self._tidyroom_post_turn_diagnostic_sequence += 1
+        if is_post_turn_full_capture:
+            self._tidyroom_post_turn_diagnostic_sequence += 1
         sequence = self._tidyroom_post_turn_diagnostic_sequence
+        capture_label = "initial" if is_initial_912_survey_capture else f"postturn_{sequence:03d}"
         self._tidyroom_post_turn_perception_blocked = False
         started_at = time.monotonic()
+        previous_unified_signature: tuple[str, ...] | None = None
 
         for attempt in range(1, self._TIDYROOM_POST_TURN_MAX_ATTEMPTS + 1):
             logger.info(
@@ -428,7 +493,7 @@ class PreliminaryBaselineAgent(VLMAgent):
             capture_kwargs.update(
                 is_save=True,
                 include_images=True,
-                save_label=f"postturn_{sequence:03d}_attempt_{attempt:02d}",
+                save_label=f"{capture_label}_attempt_{attempt:02d}",
             )
             result = super()._acquire_camera_perception(subject, **capture_kwargs)
             capture_finished_at = time.monotonic()
@@ -438,13 +503,23 @@ class PreliminaryBaselineAgent(VLMAgent):
             consistent, reason, gap, threshold = self._tidyroom_perception_is_consistent(
                 diagnostics
             )
+            if consistent and diagnostics.get("source") == "unified":
+                raw_signature = diagnostics.get("visible_object_ids") or ()
+                signature = tuple(str(object_id) for object_id in raw_signature)
+                if not signature:
+                    # 兼容只提供数量、不提供 ID 集合的自定义 mapper。
+                    signature = (f"count:{diagnostics.get('visible_object_count', 0)}",)
+                if signature != previous_unified_signature:
+                    consistent = False
+                    reason = "unified_waiting_for_stable_frame"
+                    previous_unified_signature = signature
             logger.info(
                 "Tidy-room post-turn perception sequence={} attempt={}/{}: "
                 "capture_start={:.3f}s capture_end={:.3f}s capture_duration={:.3f}s "
                 "visible={} aligned={} segmentation_regions={} gap={} threshold={} "
                 "mapped_pixels={}/{} mapped_pixel_coverage={:.4f} "
                 "coverage_threshold={:.2f} status={} reason={} "
-                "image_label=postturn_{:03d}_attempt_{:02d}",
+                "image_label={}",
                 sequence,
                 attempt,
                 self._TIDYROOM_POST_TURN_MAX_ATTEMPTS,
@@ -462,11 +537,11 @@ class PreliminaryBaselineAgent(VLMAgent):
                 self._TIDYROOM_MIN_MAPPED_PIXEL_COVERAGE,
                 "accepted" if consistent else "retry",
                 reason,
-                sequence,
-                attempt,
+                f"{capture_label}_attempt_{attempt:02d}",
             )
             if consistent:
                 self._remember_survey_frame(result[0])
+                self._tidyroom_retake_missing_frame = False
                 return result
 
         self._tidyroom_post_turn_perception_blocked = True
@@ -485,6 +560,32 @@ class PreliminaryBaselineAgent(VLMAgent):
         diagnostics: dict[str, Any],
     ) -> tuple[bool, str, int, int]:
         """判定 raw segmentation 与最终 ID 映射是否发生明显脱节。"""
+        if diagnostics.get("source") == "unified":
+            visible = max(int(diagnostics.get("visible_object_count", 0)), 0)
+            if not diagnostics.get("image_present"):
+                return False, "unified_image_missing", 0, cls._TIDYROOM_MIN_UNIFIED_OBJECTS
+            try:
+                right_nonblack = float(diagnostics.get("right_nonblack_ratio", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                right_nonblack = 0.0
+            if right_nonblack < 0.05:
+                return False, "unified_segmentation_black", visible, cls._TIDYROOM_MIN_UNIFIED_OBJECTS
+            try:
+                left_right_difference = float(
+                    diagnostics.get("left_right_difference_ratio", 1.0) or 0.0
+                )
+            except (TypeError, ValueError):
+                left_right_difference = 0.0
+            if left_right_difference < 0.20:
+                return (
+                    False,
+                    "unified_segmentation_still_rgb",
+                    visible,
+                    cls._TIDYROOM_MIN_UNIFIED_OBJECTS,
+                )
+            if visible < cls._TIDYROOM_MIN_UNIFIED_OBJECTS:
+                return False, "unified_objects_not_ready", visible, cls._TIDYROOM_MIN_UNIFIED_OBJECTS
+            return True, "unified_perception_ready", 0, cls._TIDYROOM_MIN_UNIFIED_OBJECTS
         required_keys = {
             "visible_object_count",
             "aligned_object_count",
@@ -525,21 +626,28 @@ class PreliminaryBaselineAgent(VLMAgent):
         return super()._trim_history_messages()
 
     def _should_use_lightweight_perception(self, subject: Any) -> bool:
-        """首帧/常规扫描只读结构化状态，约定的第二帧直接做完整采集。"""
+        """新版整理房间先完整采集并保存初始正向画面。"""
         task_type = normalize_task_type(subject)
         if task_type == "raven":
             # 瑞文题图在 task_data 中，不需要采集 3D 场景相机。
             return True
         if task_type != "tidyroom":
             return False
+        if (
+            self._task_strategy is not None
+            and not self._tidyroom_survey_frames
+        ):
+            return False
         if self._last_executed_action_name == "turn_in_degree":
+            last_degree = int(
+                (self._last_executed_action.get("parameters") or {}).get("degree", 0)
+            )
+            if last_degree == 0 and not self._tidyroom_retake_missing_frame:
+                return True
             # 转向后的首份数据必须同时读取 raw segmentation 与 visible_objects，
             # 才能发现可见对象缓存只返回少量 ID 的不同步问题。
             return False
-        return not bool(
-            self._task_strategy is not None
-            and self._task_strategy.should_force_second_frame_vlm()
-        )
+        return True
 
     def _should_refresh_lightweight_scene(self, subject: Any) -> bool:
         """完整建图后只做目标级刷新，避免每一步重新枚举整幅视野。"""
@@ -551,7 +659,7 @@ class PreliminaryBaselineAgent(VLMAgent):
         return self._task_strategy.needs_scene_perception()
 
     def _lightweight_empty_scene_retry_delay(self, subject: Any) -> float:
-        """轻量首帧不重试；转向后的等待与重试由完整感知入口负责。"""
+        """首帧的等待与重试由完整感知入口负责。"""
         del subject
         return 0.0
 
@@ -561,7 +669,7 @@ class PreliminaryBaselineAgent(VLMAgent):
         return 0.0
 
     def _should_force_vlm_after_empty_lightweight_perception(self, subject: Any) -> bool:
-        """空结构化结果不原地重试也不立即调用 VLM，交给本地扫描器转向。"""
+        """空结构化结果不交给未稳定的轻量感知直接调用 VLM。"""
         del subject
         return False
 
@@ -717,17 +825,32 @@ class PreliminaryBaselineAgent(VLMAgent):
             and self._tidyroom_post_turn_perception_blocked
         ):
             self._tidyroom_post_turn_perception_blocked = False
+            self._tidyroom_retake_missing_frame = True
             return {
                 "action": "turn_in_degree",
-                "parameters": {"degree": 45},
+                "parameters": {"degree": 0},
                 "output": 0,
                 "think": (
-                    "转向后的分割区域与可见对象列表连续不同步；已丢弃异常观察，"
-                    "不调用 VLM、不抓取目标，安全转向 45 度后重新感知。"
+                    "分割区域与可见对象列表连续不同步；已丢弃异常观察，"
+                    "保持初始朝向并重新采集稳定帧。"
                 ),
             }
         if self._task_strategy is None or self._task_context is None:
             return None
+        if (
+            normalize_task_type(subject) == "tidyroom"
+            and self._task_strategy.survey_is_due()
+        ):
+            if not self._tidyroom_survey_is_ready(self._task_strategy):
+                self._tidyroom_retake_missing_frame = True
+                return {
+                    "action": "turn_in_degree",
+                    "parameters": {"degree": 0},
+                    "output": 0,
+                    "think": "初始正向分割稳定帧尚未采集，保持朝向补采后再进行单图盘点。",
+                }
+            self._task_strategy.note_survey_attempted()
+            run_scene_survey(self._task_strategy, self)
         local_action = self._task_strategy.next_local_action(self._task_context)
         if local_action is None:
             # 升级原因是在本地决策阶段产生的，调用 VLM 前刷新纯文本状态即可，不能重复 observe。

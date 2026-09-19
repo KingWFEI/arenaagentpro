@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -16,6 +17,12 @@ from arenaagent.preliminary_baseline_agent.preliminary_baseline_agent import Pre
 from arenaagent.preliminary_baseline_agent.task_runtime import TaskContext
 from arenaagent.preliminary_baseline_agent.tasks.tidyroom.strategy import TidyRoomStrategy
 from arenaagent.preliminary_baseline_agent.tasks.tidyroom.survey import run_scene_survey
+from arenaagent.preliminary_baseline_agent.tasks.tidyroom.furniture_priors import (
+    FIXED_FURNITURE_PRIORS,
+)
+from arenaagent.preliminary_baseline_agent.tasks.tidyroom.vlm_client import (
+    build_tidyroom_vision_client_from_env,
+)
 from arenaagent.preliminary_baseline_agent.tasks.tidyroom.world_model import TidyRoomWorldModel
 from arenaagent.semantic_mapper import SemanticMapper
 from arenaagent.tongsim_grpc_client import TongSimGrpcClient
@@ -117,13 +124,94 @@ class UnifiedPerceptionTest(unittest.TestCase):
         self.assertEqual(info[0]["world_aabb"]["max"]["z"], 127.0)
         self.assertEqual(info[1]["object_id"], "7")
 
-    def test_unified_path_leaves_diagnostics_unavailable(self) -> None:
-        """服务端已保证同帧，因此不再计算像素覆盖率来二次校验。"""
+    def test_fixed_room_coordinates_bind_destinations_and_block_furniture_pickup(self) -> None:
+        world = TidyRoomWorldModel({})
+        names = ("ottoman", "main_sofa", "coffee_table", "dining_table", "trash_bin")
+        visible = []
+        mapping = {}
+        ids = {
+            "ottoman": "13",
+            "main_sofa": "14",
+            "coffee_table": "15",
+            "dining_table": "16",
+            "trash_bin": "18",
+        }
+        for name in names:
+            object_id = ids[name]
+            visible.append(
+                {
+                    "object_id": object_id,
+                    "shape": "rectangle",
+                    "world_aabb": FIXED_FURNITURE_PRIORS[name]["world_aabb"],
+                }
+            )
+            mapping[object_id] = object_id
+        context = TaskContext(
+            task_type="tidyroom",
+            subject={},
+            task_response={},
+            visible_objects=visible,
+            object_in_hand=None,
+            movable_objects=[],
+            action_histories=[],
+            raw_to_mapped_id=mapping,
+        )
+
+        world.observe(context)
+
+        self.assertTrue(world.fixed_room_prior_active)
+        self.assertEqual(world.scene_anchors["14"]["type"], "sofa")
+        self.assertEqual(world.scene_anchors["16"]["type"], "dining_table")
+        self.assertEqual(world.scene_anchors["18"]["type"], "trash_bin")
+        self.assertEqual(world.fixed_furniture_labels["13"], "ottoman")
+
+        world.apply_semantic_hints(
+            {"object_id": "13", "semantic_label": "pillow", "destination_type": "sofa"},
+            context,
+        )
+        self.assertEqual(world.targets, {})
+
+    def test_fixed_room_prior_supplies_unseen_dining_table_coordinates(self) -> None:
+        world = TidyRoomWorldModel({})
+        names = ("ottoman", "main_sofa", "coffee_table")
+        visible = [
+            {
+                "object_id": str(index + 13),
+                "shape": "rectangle",
+                "world_aabb": FIXED_FURNITURE_PRIORS[name]["world_aabb"],
+            }
+            for index, name in enumerate(names)
+        ]
+        context = TaskContext(
+            task_type="tidyroom",
+            subject={},
+            task_response={},
+            visible_objects=visible,
+            object_in_hand=None,
+            movable_objects=[],
+            action_histories=[],
+            raw_to_mapped_id={str(index + 13): str(index + 13) for index in range(3)},
+        )
+
+        world.observe(context)
+
+        anchor = world.scene_anchors["fixed:dining_table"]
+        self.assertEqual(anchor["source"], "fixed_coordinate_prior_unbound")
+        self.assertEqual(anchor["object_info"]["world_aabb"], FIXED_FURNITURE_PRIORS["dining_table"]["world_aabb"])
+
+    def test_unified_path_reports_readiness_diagnostics(self) -> None:
+        """统一接口仍要暴露图像完整性，供巡视采集过滤未就绪帧。"""
         mapper = SemanticMapper(tongsim=UnifiedTongSim(_image_b64()), character_id="agent")
 
         mapper.get_perception_from_camera()
 
-        self.assertEqual(mapper.last_perception_diagnostics, {})
+        diagnostics = mapper.last_perception_diagnostics
+        self.assertEqual(diagnostics["source"], "unified")
+        self.assertEqual(diagnostics["visible_object_count"], 2)
+        self.assertEqual(diagnostics["visible_object_ids"], ("4", "7"))
+        self.assertTrue(diagnostics["image_present"])
+        self.assertGreater(diagnostics["right_nonblack_ratio"], 0.0)
+        self.assertEqual(diagnostics["left_right_difference_ratio"], 0.0)
 
     def test_details_can_be_skipped(self) -> None:
         mapper = SemanticMapper(tongsim=UnifiedTongSim(_image_b64()), character_id="agent")
@@ -227,7 +315,7 @@ class ObjectInHandQueryTest(unittest.TestCase):
 
 
 class SceneSurveyTest(unittest.TestCase):
-    """扫完整圈后一次性标注：一次请求换掉逐帧往返。"""
+    """初始正向分割稳定后，只发一帧做语义标注。"""
 
     @staticmethod
     def _setup(response_text: str, frames: list[str], raw_to_mapped: dict[str, str]):
@@ -248,7 +336,7 @@ class SceneSurveyTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls: list[list[dict]] = []
 
-            def invoke(self, messages):
+            def invoke(self, messages, **kwargs):
                 self.calls.append(messages)
                 return SimpleNamespace(text=response_text)
 
@@ -275,14 +363,40 @@ class SceneSurveyTest(unittest.TestCase):
         self.assertEqual(strategy.world.declared_targets, ["37"])
         self.assertEqual(strategy.world.scene_anchors["19"]["type"], "shoe_storage")
 
-    def test_every_retained_frame_is_sent_in_one_request(self) -> None:
+    def test_only_latest_retained_frame_is_sent(self) -> None:
         strategy, agent, client = self._setup('{"items": [], "furniture": []}', [_image_b64()] * 3, {})
 
         run_scene_survey(strategy, agent)
 
         self.assertEqual(len(client.calls), 1)
         parts = client.calls[0][0]["content"]
-        self.assertEqual(sum(1 for part in parts if part["type"] == "image_url"), 3)
+        self.assertEqual(sum(1 for part in parts if part["type"] == "image_url"), 1)
+
+    def test_survey_drops_destination_not_confirmed_by_furniture_list(self) -> None:
+        response = json.dumps(
+            {
+                "items": [
+                    {
+                        "object_id": "34",
+                        "semantic_label": "drink_container",
+                        "destination_type": "dining_table",
+                        "destination_object_id": "20",
+                    }
+                ],
+                "furniture": [{"object_id": "14", "destination_type": "sofa"}],
+            }
+        )
+        strategy, agent, _ = self._setup(
+            response,
+            [_image_b64()],
+            {"34": "34", "20": "20", "14": "14"},
+        )
+
+        run_scene_survey(strategy, agent)
+
+        self.assertEqual(strategy.world.targets["34"]["destination_type"], "dining_table")
+        self.assertNotIn("20", strategy.world.scene_anchors)
+        self.assertEqual(strategy.world.scene_anchors["14"]["type"], "sofa")
 
     def test_survey_accepts_a_bare_list(self) -> None:
         """模型有时直接回一个数组，每条按自己的字段分类。"""
@@ -312,13 +426,10 @@ class SceneSurveyTest(unittest.TestCase):
         self.assertEqual(applied, 0)
         self.assertEqual(strategy.world.targets, {})
 
-    def test_survey_is_due_only_after_a_full_scan(self) -> None:
+    def test_survey_is_due_immediately_in_single_frame_mode(self) -> None:
         strategy = TidyRoomStrategy()
         strategy.reset({"task_type": "tidyroom", "subject": "整理房间"})
 
-        self.assertFalse(strategy.survey_is_due())
-
-        strategy.scanner.turns_completed = strategy.scanner.turns_required
         self.assertTrue(strategy.survey_is_due())
 
         strategy.note_survey_attempted()
@@ -378,14 +489,14 @@ class SceneSurveyTest(unittest.TestCase):
         self.assertEqual(strategy.targets["51"]["status"], "pending")
         self.assertFalse(strategy._all_targets_settled())
 
-    def test_survey_is_not_due_when_the_task_declared_targets(self) -> None:
+    def test_survey_is_still_due_when_the_task_declared_targets(self) -> None:
         strategy = TidyRoomStrategy()
         strategy.reset(
             {"task_type": "tidyroom", "subject": "整理房间", "movable_object_id": ["BP_Pillow_10_TEST"]}
         )
         strategy.scanner.turns_completed = strategy.scanner.turns_required
 
-        self.assertFalse(strategy.survey_is_due())
+        self.assertTrue(strategy.survey_is_due())
 
 
 class JsonExtractionTest(unittest.TestCase):
@@ -431,6 +542,23 @@ class JsonExtractionTest(unittest.TestCase):
 
         self.assertEqual(parsed["action"], "finish_task")
 
+    def test_object_wrapping_multiple_arrays_is_kept_whole(self) -> None:
+        text = """```json
+{
+  "items": [
+    {"object_id": "34", "semantic_label": "food", "destination_type": "dining_table"},
+    {"object_id": "33", "semantic_label": "cup", "destination_type": "dining_table"}
+  ],
+  "furniture": [{"object_id": "14", "destination_type": "sofa"}]
+}
+```"""
+
+        parsed = extract_last_json_from_text(text)
+
+        self.assertIsInstance(parsed, dict)
+        self.assertEqual([item["object_id"] for item in parsed["items"]], ["34", "33"])
+        self.assertEqual(parsed["furniture"][0]["object_id"], "14")
+
     def test_brackets_inside_strings_do_not_confuse_the_scan(self) -> None:
         text = (
             '```json\n[{"think":"看到 { 和 ] 这类字符","action":"turn_in_degree",'
@@ -465,6 +593,7 @@ class TidyRoomCoverageGuardTest(unittest.TestCase):
         )
         strategy.world.apply_scene_annotations(
             [
+                {"anchor_object_id": "14", "destination_type": "sofa"},
                 {
                     "object_id": "51",
                     "semantic_label": "pillow",
@@ -525,6 +654,34 @@ class TaskSpecificVlmClientTest(unittest.TestCase):
 
         self.assertEqual(agent._vlm_client_for_current_task(), "MAIN")
 
+    def test_tidyroom_client_uses_kimi_vision_without_thinking(self) -> None:
+        sentinel = object()
+        environment = {
+            "TIDYROOM_ENABLE_VLM": "1",
+            "TIDYROOM_VLM_MODEL": "",
+            "TIDYROOM_VLM_API_BASE": "",
+            "TIDYROOM_VLM_API_KEY": "",
+            "VLM_CLIENT_CFG_API_KEY": "test-only-key",
+        }
+        with patch.dict("os.environ", environment, clear=False), patch(
+            "arenaagent.preliminary_baseline_agent.aux_client.ClientFactory.build",
+            return_value=sentinel,
+        ) as build:
+            client = build_tidyroom_vision_client_from_env()
+
+        self.assertIs(client, sentinel)
+        client_type, cfg = build.call_args.args
+        self.assertEqual(client_type, "openai")
+        self.assertEqual(cfg.name, "kimi-k2.6")
+        self.assertEqual(cfg.request_timeout_seconds, 45.0)
+        self.assertEqual(
+            cfg.chat_completion_kwargs,
+            {
+                "extra_body": {"thinking": {"type": "disabled"}},
+                "max_tokens": 2048,
+            },
+        )
+
 
 class TidyRoomTargetDiscoveryTest(unittest.TestCase):
     """912 不下发目标清单，整理房间的目标只能由模型在感知中指名。"""
@@ -572,7 +729,300 @@ class TidyRoomTargetDiscoveryTest(unittest.TestCase):
         self.assertEqual(world.declared_targets, [])
         self.assertEqual(world.targets, {})
 
-    def test_destination_anchor_is_created_from_the_hint(self) -> None:
+    def test_unrelated_plant_cannot_become_a_sofa_target(self) -> None:
+        """恢复请求把绿植标成 sofa 物品时不能让角色去抓环境装饰。"""
+        world = TidyRoomWorldModel({})
+
+        world.apply_semantic_hints(
+            {
+                "object_id": "48",
+                "semantic_label": "plant",
+                "destination_type": "sofa",
+            },
+            self._context({"plant": "48"}),
+        )
+
+        self.assertEqual(world.declared_targets, [])
+
+    def test_walnut_sized_object_cannot_be_treated_as_a_pillow(self) -> None:
+        """真实日志中 4cm 的核桃被 K2.6 标成 pillow，执行前应改送餐桌。"""
+        world = TidyRoomWorldModel({})
+        context = TaskContext(
+            task_type="tidyroom",
+            subject={},
+            task_response={},
+            visible_objects=[
+                {
+                    "object_id": "36",
+                    "world_aabb": {
+                        "min": {"x": 302.90, "y": 368.94, "z": 33.69},
+                        "max": {"x": 307.06, "y": 372.67, "z": 36.44},
+                    },
+                }
+            ],
+            object_in_hand=None,
+            movable_objects=[],
+            action_histories=[],
+            raw_to_mapped_id={"36": "36"},
+        )
+        world.observe(context)
+
+        world.apply_semantic_hints(
+            {"object_id": "36", "semantic_label": "pillow", "destination_type": "sofa"},
+            context,
+        )
+
+        record = world.targets["36"]
+        self.assertEqual(record["semantic_label"], "small_food")
+        self.assertEqual(record["destination_type"], "dining_table")
+
+    def test_compact_brown_walnut_mislabelled_as_trash_goes_to_dining_table(self) -> None:
+        """17:53 实测核桃：棕色、不规则、约 4.88×4.46×5.05cm。"""
+        world = TidyRoomWorldModel({})
+        info = {
+            "object_id": "36",
+            "color": "brown",
+            "shape": "irregular",
+            "world_aabb": {
+                "min": {"x": 751.6105, "y": 356.1687, "z": 1.3861},
+                "max": {"x": 756.4903, "y": 360.6278, "z": 6.4329},
+            },
+        }
+        context = TaskContext(
+            task_type="tidyroom",
+            subject={},
+            task_response={},
+            visible_objects=[info],
+            object_in_hand=None,
+            movable_objects=[],
+            action_histories=[],
+            raw_to_mapped_id={"36": "36"},
+        )
+        world.observe(context)
+
+        world.apply_semantic_hints(
+            {"object_id": "36", "semantic_label": "trash", "destination_type": "trash_bin"},
+            context,
+        )
+
+        self.assertEqual(world.targets["36"]["semantic_label"], "food_walnut")
+        self.assertEqual(world.targets["36"]["destination_type"], "dining_table")
+
+    def test_compact_shape_rule_does_not_reclassify_elongated_brown_trash(self) -> None:
+        world = TidyRoomWorldModel({})
+        info = {
+            "object_id": "37",
+            "color": "brown",
+            "shape": "irregular",
+            "world_aabb": {
+                "min": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "max": {"x": 3.0, "y": 12.0, "z": 4.0},
+            },
+        }
+        context = TaskContext(
+            task_type="tidyroom",
+            subject={},
+            task_response={},
+            visible_objects=[info],
+            object_in_hand=None,
+            movable_objects=[],
+            action_histories=[],
+            raw_to_mapped_id={"37": "37"},
+        )
+        world.observe(context)
+        world.apply_semantic_hints(
+            {"object_id": "37", "semantic_label": "trash", "destination_type": "trash_bin"},
+            context,
+        )
+
+        self.assertEqual(world.targets["37"]["semantic_label"], "trash")
+        self.assertEqual(world.targets["37"]["destination_type"], "trash_bin")
+
+    def test_bolster_sized_object_overrides_cup_misclassification(self) -> None:
+        """真实日志中约 45×16×15cm 的地面长抱枕被误标成 cup。"""
+        world = TidyRoomWorldModel({})
+        context = TaskContext(
+            task_type="tidyroom",
+            subject={},
+            task_response={},
+            visible_objects=[
+                {
+                    "object_id": "33",
+                    "world_aabb": {
+                        "min": {"x": 423.36, "y": 203.88, "z": 2.50},
+                        "max": {"x": 468.66, "y": 220.12, "z": 17.15},
+                    },
+                }
+            ],
+            object_in_hand=None,
+            movable_objects=[],
+            action_histories=[],
+            raw_to_mapped_id={"33": "33"},
+        )
+        world.observe(context)
+
+        world.apply_semantic_hints(
+            {"object_id": "33", "semantic_label": "cup", "destination_type": "dining_table"},
+            context,
+        )
+
+        record = world.targets["33"]
+        self.assertEqual(record["semantic_label"], "pillow")
+        self.assertEqual(record["destination_type"], "sofa")
+
+    def test_geometric_inventory_recovers_omitted_bolster_but_not_ottoman(self) -> None:
+        """单图模型漏掉 45cm 长抱枕时补回，同时排除 75cm 脚凳。"""
+        world = TidyRoomWorldModel({})
+        visible_objects = [
+            {
+                "object_id": "14",
+                "world_aabb": {
+                    "min": {"x": 226.5, "y": 169.1, "z": -0.5},
+                    "max": {"x": 338.4, "y": 579.5, "z": 98.9},
+                },
+            },
+            {
+                "object_id": "33",
+                "world_aabb": {
+                    "min": {"x": 423.36, "y": 203.88, "z": 2.50},
+                    "max": {"x": 468.66, "y": 220.12, "z": 17.15},
+                },
+            },
+            {
+                "object_id": "13",
+                "world_aabb": {
+                    "min": {"x": 350.5, "y": 175.4, "z": 1.7},
+                    "max": {"x": 409.5, "y": 250.6, "z": 28.6},
+                },
+            },
+        ]
+        context = TaskContext(
+            task_type="tidyroom",
+            subject={},
+            task_response={},
+            visible_objects=visible_objects,
+            object_in_hand=None,
+            movable_objects=[],
+            action_histories=[],
+            raw_to_mapped_id={"sofa": "14", "33": "33", "13": "13"},
+        )
+        world.observe(context)
+        world.apply_scene_annotations(
+            [{"anchor_object_id": "14", "destination_type": "sofa"}],
+            context,
+        )
+
+        discovered = world.discover_geometric_pillow_targets(context)
+
+        self.assertEqual(discovered, 1)
+        self.assertIn("33", world.targets)
+        self.assertEqual(world.targets["33"]["destination_type"], "sofa")
+        self.assertNotIn("13", world.targets)
+
+    def test_chairs_are_rejected_as_dining_table_anchors(self) -> None:
+        """K2.6 会把餐桌周围的椅子一起标成 dining_table，按承载面排除。"""
+        world = TidyRoomWorldModel({})
+        chair = {
+            "object_id": "22",
+            "world_aabb": {
+                "min": {"x": -187.5, "y": 413.9, "z": -0.4},
+                "max": {"x": -126.7, "y": 475.3, "z": 79.8},
+            },
+        }
+        table = {
+            "object_id": "16",
+            "world_aabb": {
+                "min": {"x": -297.0, "y": 481.0, "z": 3.0},
+                "max": {"x": -137.0, "y": 561.0, "z": 78.8},
+            },
+        }
+        context = TaskContext(
+            task_type="tidyroom",
+            subject={},
+            task_response={},
+            visible_objects=[chair, table],
+            object_in_hand=None,
+            movable_objects=[],
+            action_histories=[],
+            # 避免原始名称提前把 16 自动登记成通用 table；本用例专门
+            # 验证视觉注释能保留真餐桌、排除尺寸相近的椅子。
+            raw_to_mapped_id={"chair": "22", "unknown16": "16"},
+        )
+        world.observe(context)
+
+        world.apply_scene_annotations(
+            [
+                {"anchor_object_id": "22", "destination_type": "dining_table"},
+                {"anchor_object_id": "16", "destination_type": "dining_table"},
+            ],
+            context,
+        )
+
+        self.assertNotIn("22", world.scene_anchors)
+        self.assertEqual(world.scene_anchors["16"]["type"], "dining_table")
+
+    def test_human_sized_region_cannot_be_discovered_as_a_pickup(self) -> None:
+        """即使视觉模型把 NPC 标成鞋，也不能进入抓取队列。"""
+        world = TidyRoomWorldModel({})
+        world.scene_objects["2"] = {
+            "object_id": "2",
+            "world_aabb": {
+                "min": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "max": {"x": 55.0, "y": 45.0, "z": 148.0},
+            },
+        }
+
+        world.apply_semantic_hints(
+            {
+                "object_id": "2",
+                "semantic_label": "shoe",
+                "destination_type": "shoe_storage",
+            },
+            self._context({"2": "2"}),
+        )
+
+        self.assertEqual(world.declared_targets, [])
+        self.assertEqual(world.targets, {})
+
+    def test_item_already_beside_destination_is_not_added_as_clutter(self) -> None:
+        world = TidyRoomWorldModel({})
+        world.scene_objects.update(
+            {
+                "6": {
+                    "object_id": "6",
+                    "world_aabb": {
+                        "min": {"x": 0.0, "y": 0.0, "z": 0.0},
+                        "max": {"x": 100.0, "y": 40.0, "z": 80.0},
+                    },
+                },
+                "10": {
+                    "object_id": "10",
+                    "world_aabb": {
+                        "min": {"x": 105.0, "y": 10.0, "z": 0.0},
+                        "max": {"x": 125.0, "y": 30.0, "z": 20.0},
+                    },
+                },
+            }
+        )
+        context = self._context({"rack": "6", "display-shoe": "10"})
+
+        applied = world.apply_scene_annotations(
+            [
+                {"object_id": "6", "destination_type": "shoe_storage"},
+                {
+                    "object_id": "10",
+                    "semantic_label": "shoe",
+                    "destination_type": "shoe_storage",
+                },
+            ],
+            context,
+        )
+
+        self.assertEqual(applied, 1)
+        self.assertEqual(world.declared_targets, [])
+        self.assertEqual(world.targets, {})
+
+    def test_destination_anchor_is_not_created_from_an_unconfirmed_item_hint(self) -> None:
         world = TidyRoomWorldModel({})
 
         world.apply_semantic_hints(
@@ -585,8 +1035,8 @@ class TidyRoomTargetDiscoveryTest(unittest.TestCase):
             self._context({"4": "4", "14": "14"}),
         )
 
-        self.assertEqual(world.scene_anchors["14"]["type"], "sofa")
-        self.assertTrue(world.has_destination("sofa"))
+        self.assertNotIn("14", world.scene_anchors)
+        self.assertFalse(world.has_destination("sofa"))
 
     def test_scene_annotations_register_many_targets_at_once(self) -> None:
         """一次回答就建立多个目标与家具，不必为每件物品再往返一次模型。"""
@@ -595,6 +1045,8 @@ class TidyRoomTargetDiscoveryTest(unittest.TestCase):
 
         applied = world.apply_scene_annotations(
             [
+                {"anchor_object_id": "20", "destination_type": "shoe_storage"},
+                {"anchor_object_id": "38", "destination_type": "trash_bin"},
                 {
                     "object_id": "37",
                     "semantic_label": "shoe",
@@ -612,13 +1064,32 @@ class TidyRoomTargetDiscoveryTest(unittest.TestCase):
             context,
         )
 
-        self.assertEqual(applied, 3)
+        self.assertEqual(applied, 5)
         self.assertEqual(sorted(world.declared_targets), ["37", "41"])
         self.assertEqual(world.targets["37"]["destination_type"], "shoe_storage")
         self.assertEqual(world.targets["41"]["destination_type"], "trash_bin")
         self.assertEqual(world.scene_anchors["20"]["type"], "shoe_storage")
         self.assertEqual(world.scene_anchors["38"]["type"], "trash_bin")
         self.assertEqual(world.scene_anchors["42"]["type"], "dining_table")
+
+    def test_unconfirmed_destination_reference_does_not_create_furniture(self) -> None:
+        world = TidyRoomWorldModel({})
+        context = self._context({"34": "34", "20": "20"})
+
+        world.apply_scene_annotations(
+            [
+                {
+                    "object_id": "34",
+                    "semantic_label": "drink_container",
+                    "destination_type": "dining_table",
+                    "destination_object_id": "20",
+                }
+            ],
+            context,
+        )
+
+        self.assertEqual(world.targets["34"]["destination_type"], "dining_table")
+        self.assertNotIn("20", world.scene_anchors)
 
     def test_furniture_written_in_item_shape_becomes_an_anchor(self) -> None:
         """模型有时把家具名直接填进 semantic_label，不能当成待整理物品。"""
@@ -645,8 +1116,8 @@ class TidyRoomTargetDiscoveryTest(unittest.TestCase):
     def test_objects_seen_earlier_survive_later_frames(self) -> None:
         """912 没有按物体查 AABB 的接口，只能靠累积缓存。
 
-        走到目的地跟前时那件家具往往已经不在视野里，若每帧整体替换，放置校验
-        就会永远 missing_aabb。
+        走到目的地跟前时那件家具往往已经不在视野里，若每帧整体替换，按 ID 查询
+        全局 AABB 就会落空。
         """
         frames = [
             {"image": "a", "objects": [{"object_id": "19", "world_aabb": {"max": {"x": 2}}}]},
@@ -687,6 +1158,59 @@ class TidyRoomTargetDiscoveryTest(unittest.TestCase):
 
         self.assertNotIn("20", world.scene_anchors)
         self.assertEqual(world.scene_anchors["14"]["type"], "trash_bin")
+
+    def test_slender_floor_lamp_cannot_become_shoe_storage(self) -> None:
+        world = TidyRoomWorldModel({})
+        world.scene_objects["20"] = {
+            "object_id": "20",
+            "world_aabb": {
+                "min": {"x": 606.5, "y": 608.6, "z": 0.0},
+                "max": {"x": 634.0, "y": 626.9, "z": 136.4},
+            },
+        }
+
+        world.apply_scene_annotations(
+            [{"anchor_object_id": "20", "destination_type": "shoe_storage"}],
+            self._context({"lamp": "20"}),
+        )
+
+        self.assertNotIn("20", world.scene_anchors)
+
+    def test_fixed_tv_console_cannot_be_relabelled_as_shoe_storage(self) -> None:
+        world = TidyRoomWorldModel({})
+        fixed_ids = {
+            "main_sofa": "14",
+            "dining_table": "16",
+            "tv_console": "17",
+            "trash_bin": "18",
+        }
+        visible = [
+            {
+                "object_id": object_id,
+                "shape": "rectangle",
+                "world_aabb": FIXED_FURNITURE_PRIORS[name]["world_aabb"],
+            }
+            for name, object_id in fixed_ids.items()
+        ]
+        context = TaskContext(
+            task_type="tidyroom",
+            subject={},
+            task_response={},
+            visible_objects=visible,
+            object_in_hand=None,
+            movable_objects=[],
+            action_histories=[],
+            raw_to_mapped_id={object_id: object_id for object_id in fixed_ids.values()},
+        )
+        world.observe(context)
+
+        world.apply_scene_annotations(
+            [{"anchor_object_id": "17", "destination_type": "shoe_storage"}],
+            context,
+        )
+
+        self.assertEqual(world.fixed_furniture_labels["17"], "tv_console")
+        self.assertNotEqual(world.scene_anchors.get("17", {}).get("type"), "shoe_storage")
 
     def test_a_destination_is_never_also_a_target(self) -> None:
         """模型偶尔把垃圾桶同时写成物品和目的地，角色会去搬垃圾桶。"""

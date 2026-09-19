@@ -85,10 +85,3 @@ class TargetScheduler:
         location = center_xy(target.get("object_info", {}).get("world_aabb"))
         if location is not None:
             self.estimated_agent_xy = location
-
-    def mark_at_destination(self, plan: dict[str, Any]) -> None:
-        location = plan.get("move_target_location") or {}
-        try:
-            self.estimated_agent_xy = float(location["X"]), float(location["Y"])
-        except (KeyError, TypeError, ValueError):
-            pass

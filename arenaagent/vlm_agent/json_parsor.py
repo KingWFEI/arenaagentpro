@@ -105,6 +105,49 @@ def balanced_spans(text: str, opener: str, closer: str) -> list[str]:
     return spans
 
 
+def balanced_json_spans(text: str) -> list[str]:
+    """扫描文本中顶层 JSON 数组/对象，保留它们内部的异类括号。
+
+    分别扫描 ``[]`` 和 ``{}`` 会把一个 ``{"items": [...],
+    "furniture": [...]}`` 回答中的 furniture 内层数组当成最后一段
+    JSON，导致 items 全部丢失。这里用同一个栈同时追踪两类括号，
+    只在整个顶层值闭合时输出候选。
+    """
+    spans: list[str] = []
+    stack: list[str] = []
+    start = -1
+    in_string = False
+    escaped = False
+    matching = {"]": "[", "}": "{"}
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char in "[{":
+            if not stack:
+                start = index
+            stack.append(char)
+            continue
+        if char in "]}":
+            if not stack or stack[-1] != matching[char]:
+                stack.clear()
+                start = -1
+                continue
+            stack.pop()
+            if not stack and start >= 0:
+                spans.append(text[start : index + 1])
+                start = -1
+    return spans
+
+
 def extract_last_json_from_text(text):
     """
     提取最后一个 JSON 片段（数组或对象）。
@@ -138,10 +181,9 @@ def extract_last_json_from_text(text):
             .replace("！", "!")
         )
 
-        # 数组优先（回答约定是长度为 1 的数组），再退回到裸对象；各自从后往前，
-        # 最后一段才是本次回答。顺序不能颠倒，否则会先命中数组里的某个内层对象。
-        candidates = list(reversed(balanced_spans(text, "[", "]")))
-        candidates += list(reversed(balanced_spans(text, "{", "}")))
+        # 从后往前选最后一个完整顶层 JSON 值。不能把外层对象
+        # 内部的数组当成独立候选，否则盘点回答只会剩下 furniture。
+        candidates = list(reversed(balanced_json_spans(text)))
         for candidate in candidates:
             try:
                 return json.loads(fix_structural_dicts_only(candidate))

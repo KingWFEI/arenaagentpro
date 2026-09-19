@@ -66,6 +66,7 @@ def get_raven_ranked_candidates(
     legacy_candidates: list[list[int]] | None = None,
     rejected_answers: list[list[int]] | None = None,
     previous_attempts: list[dict[str, Any]] | None = None,
+    whole_image: Image.Image | None = None,
 ) -> list[list[int]] | None:
     cache = getattr(agent, "_raven_candidates_cache", None)
     if not isinstance(cache, dict):
@@ -76,6 +77,17 @@ def get_raven_ranked_candidates(
     try:
         # Import lazily so non-Raven tasks never initialize the hybrid CV/rule stack.
         from arenaagent.preliminary_baseline_agent.tasks.raven.solver import HybridRavenSolver
+        from arenaagent.preliminary_baseline_agent.tasks.raven.text_client import (
+            build_raven_text_client_from_env,
+        )
+
+        # The first submission already combines the legacy model, deterministic
+        # rules and the visual model.  Keep the independent text-only verifier for
+        # correction rounds only: constructing it on every fresh subject adds
+        # latency, while a complete visual vote does not need it.
+        if rejected_answers and not getattr(agent, "_raven_text_client_initialized", False):
+            agent.raven_text_client = build_raven_text_client_from_env()
+            agent._raven_text_client_initialized = True
 
         result = HybridRavenSolver(
             vlm_client=getattr(agent, "vlm_client", None),
@@ -85,6 +97,7 @@ def get_raven_ranked_candidates(
             legacy_ranked=legacy_candidates,
             rejected_triples=rejected_answers,
             previous_attempts=previous_attempts,
+            whole_image=whole_image,
         )
         candidates = result.ranked_triples
         agent._raven_last_diagnostics = result.diagnostics
@@ -580,6 +593,7 @@ def handle(agent: Any, params: dict[str, Any], action: dict[str, Any]) -> dict[s
         return _fail(agent, "invalid parameter: image_list")
 
     cache_key = build_raven_attempt_key(image_list, structure)
+    whole_image = to_pil_image(resolved_image_path)
     attempted_cache = getattr(agent, "_raven_attempted_answers", None)
     if not isinstance(attempted_cache, dict):
         attempted_cache = {}
@@ -592,26 +606,23 @@ def handle(agent: Any, params: dict[str, Any], action: dict[str, Any]) -> dict[s
         _persist_raven_reasoning_trace(agent, cache_key, history)
 
     legacy_candidates = get_raven_legacy_candidates(agent, cache_key, image_list, structure)
-    phase = "legacy_fast_path"
-    ranked_candidates = legacy_candidates
-    diagnostics: dict[str, Any] = {}
-    if attempted or not legacy_candidates:
-        phase = "reasoned_correction"
-        rejected_answers = [list(item) for item in sorted(attempted)]
-        ranked_candidates = get_raven_ranked_candidates(
-            agent,
-            cache_key,
-            image_list,
-            structure,
-            legacy_candidates=legacy_candidates,
-            rejected_answers=rejected_answers,
-            previous_attempts=_compact_attempts(history),
-        )
-        diagnostics = getattr(agent, "_raven_last_diagnostics", {})
-        if diagnostics.get("reasoning_mode") == "targeted_parallel_revision":
-            phase = "targeted_llm_revision"
-        if not ranked_candidates:
-            return _fail(agent, "Raven reasoned correction unavailable; refusing blind enumeration")
+    phase = "hybrid_first_pass" if not attempted else "reasoned_correction"
+    rejected_answers = [list(item) for item in sorted(attempted)]
+    ranked_candidates = get_raven_ranked_candidates(
+        agent,
+        cache_key,
+        image_list,
+        structure,
+        legacy_candidates=legacy_candidates,
+        rejected_answers=rejected_answers,
+        previous_attempts=_compact_attempts(history),
+        whole_image=whole_image,
+    )
+    diagnostics: dict[str, Any] = getattr(agent, "_raven_last_diagnostics", {})
+    if diagnostics.get("reasoning_mode") == "whole_image_single_revision":
+        phase = "whole_image_llm_revision"
+    if not ranked_candidates:
+        return _fail(agent, "Raven hybrid reasoning unavailable; refusing blind enumeration")
     chosen_answer = ranked_candidates[0] if ranked_candidates else None
     if chosen_answer is not None and tuple(chosen_answer) in attempted:
         chosen_answer = None

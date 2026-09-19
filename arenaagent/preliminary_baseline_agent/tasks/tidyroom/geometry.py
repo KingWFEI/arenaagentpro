@@ -167,4 +167,5 @@ def placement_check(
         "actual_bottom_z": bottom_z,
         "expected_support_z": expected_support_z,
         "support_region": region,
+        "destination_aabb": destination_aabb_value,
     }

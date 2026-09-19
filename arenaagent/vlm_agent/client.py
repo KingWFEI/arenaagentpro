@@ -246,9 +246,13 @@ class OpenAIClient(Client):
 
     def _invoke(self, message: Any) -> ClientResponse:
         model_name = _resolve_model_name(getattr(self._cfg, "name", ""), "OPENAI_MODEL")
+        chat_completion_kwargs = dict(
+            getattr(self._cfg, "chat_completion_kwargs", None) or {}
+        )
         response = self.native_client.chat.completions.create(
             model=model_name,
             messages=message,
+            **chat_completion_kwargs,
         )
         return ClientResponse(text=_extract_text(response), usage=getattr(response, "usage", None), raw=response)
 

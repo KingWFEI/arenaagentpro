@@ -60,6 +60,44 @@ class TaskRegistryTests(unittest.TestCase):
         self.assertIsNone(normalize_destination_type("bookshelf"))
 
 
+class TongSimLifecycleTests(unittest.TestCase):
+    class FakeTongSim:
+        def __init__(self) -> None:
+            self.destroyed = []
+            self.close_calls = 0
+
+        def destory_character(self, character_id):
+            self.destroyed.append(character_id)
+
+        def close(self):
+            self.close_calls += 1
+
+    def test_shared_tongsim_is_retained_between_subjects(self) -> None:
+        client = self.FakeTongSim()
+        agent = VLMAgent(stub=None, channel=None)
+        agent.configure_shared_tongsim(client)
+        agent.character_id = "subject-character"
+        agent._initialized = True
+
+        agent.deinit()
+
+        self.assertEqual(client.destroyed, ["subject-character"])
+        self.assertEqual(client.close_calls, 0)
+        self.assertIsNone(agent.tongsim)
+
+    def test_single_subject_still_closes_its_tongsim_client(self) -> None:
+        client = self.FakeTongSim()
+        agent = VLMAgent(stub=None, channel=None)
+        agent.tongsim = client
+        agent.character_id = "single-character"
+        agent._initialized = True
+
+        agent.deinit()
+
+        self.assertEqual(client.destroyed, ["single-character"])
+        self.assertEqual(client.close_calls, 1)
+
+
 class TaskRuntimeTests(unittest.TestCase):
     def test_lightweight_perception_reuses_object_details_without_images(self) -> None:
         class FakeTongSim:
@@ -170,7 +208,7 @@ class TaskRuntimeTests(unittest.TestCase):
             )
 
         self.assertEqual(result[0], "good-image")
-        self.assertEqual(sleep_mock.call_args_list, [call(0.25)] * 2)
+        self.assertEqual(sleep_mock.call_args_list, [call(0.75)] * 2)
         self.assertEqual(len(agent.semantic_mapper.calls), 2)
         self.assertEqual(
             agent.semantic_mapper.calls[0]["save_label"],
@@ -180,6 +218,44 @@ class TaskRuntimeTests(unittest.TestCase):
             agent.semantic_mapper.calls[1]["save_label"],
             "postturn_001_attempt_02",
         )
+        self.assertFalse(agent._tidyroom_post_turn_perception_blocked)
+
+    def test_tidyroom_unified_perception_waits_for_stable_ids_not_fixed_count(self) -> None:
+        class StabilizingUnifiedMapper:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.last_perception_diagnostics: dict = {}
+
+            def get_perception_from_camera(self, **kwargs):
+                del kwargs
+                self.calls += 1
+                ids = ("2", "7") if self.calls == 1 else tuple(str(i) for i in range(10))
+                self.last_perception_diagnostics = {
+                    "source": "unified",
+                    "visible_object_count": len(ids),
+                    "visible_object_ids": ids,
+                    "image_present": True,
+                    "right_nonblack_ratio": 0.8,
+                    "left_right_difference_ratio": 0.8,
+                }
+                return f"image-{self.calls}", [{"object_id": value} for value in ids], []
+
+        agent = PreliminaryBaselineAgent(stub=None, channel=None)
+        agent.semantic_mapper = StabilizingUnifiedMapper()
+        agent._last_executed_action_name = "turn_in_degree"
+        agent._last_executed_action = {
+            "action": "turn_in_degree",
+            "parameters": {"degree": 90},
+        }
+
+        with patch("arenaagent.preliminary_baseline_agent.preliminary_baseline_agent.time.sleep"):
+            result = agent._acquire_camera_perception(
+                {"task_type": "tidyroom"},
+                include_images=True,
+            )
+
+        self.assertEqual(result[0], "image-3")
+        self.assertEqual(agent.semantic_mapper.calls, 3)
         self.assertFalse(agent._tidyroom_post_turn_perception_blocked)
 
     def test_tidyroom_post_turn_perception_blocks_bad_data_after_retry_limit(self) -> None:
@@ -210,7 +286,7 @@ class TaskRuntimeTests(unittest.TestCase):
             )
 
         self.assertEqual(result, (None, [], []))
-        self.assertEqual(agent.semantic_mapper.calls, 5)
+        self.assertEqual(agent.semantic_mapper.calls, 10)
         self.assertTrue(agent._tidyroom_post_turn_perception_blocked)
 
     def test_tidyroom_post_turn_perception_retries_low_pixel_coverage(self) -> None:
@@ -245,7 +321,7 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result[0], "image-2")
         self.assertEqual(agent.semantic_mapper.calls, 2)
-        self.assertEqual(sleep_mock.call_args_list, [call(0.25)] * 2)
+        self.assertEqual(sleep_mock.call_args_list, [call(0.75)] * 2)
 
     def test_shared_runtime_skips_vlm_when_local_action_is_available(self) -> None:
         class FakeMapper:
@@ -298,7 +374,7 @@ class TaskRuntimeTests(unittest.TestCase):
     def test_tidyroom_uses_lightweight_perception_and_defers_intermediate_updates(self) -> None:
         agent = PreliminaryBaselineAgent(stub=None, channel=None)
         agent._ensure_task_strategy({"task_type": "tidyroom", "subject": "整理"})
-        self.assertTrue(agent._should_use_lightweight_perception({"task_type": "tidyroom"}))
+        self.assertFalse(agent._should_use_lightweight_perception({"task_type": "tidyroom"}))
         agent._last_executed_action_name = "move_and_take_object"
         result = agent._apply_action({"result": "success"})
         self.assertEqual(result, {"deferred": True})
@@ -355,7 +431,7 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(agent._lightweight_empty_scene_retry_delay(subject), 0.0)
         self.assertFalse(agent._should_force_vlm_after_empty_lightweight_perception(subject))
 
-    def test_tidyroom_retries_empty_lightweight_scene_once(self) -> None:
+    def test_tidyroom_initial_full_capture_does_not_enter_lightweight_retry(self) -> None:
         class RetryMapper:
             def __init__(self) -> None:
                 self.calls = 0
@@ -391,12 +467,19 @@ class TaskRuntimeTests(unittest.TestCase):
         agent = RetryAgent(stub=None, channel=None)
         agent._initialized = True
         agent.semantic_mapper = RetryMapper()
-        result = agent.run_step({"task_type": "tidyroom", "subject": "整理房间"}, {})
+        result = agent.run_step(
+            {
+                "task_type": "tidyroom",
+                "subject": "整理房间",
+                "movable_object_id": ["BP_Pillow_TEST"],
+            },
+            {},
+        )
 
         self.assertEqual(result["result"], "success")
-        self.assertEqual(agent.semantic_mapper.calls, 2)
+        self.assertEqual(agent.semantic_mapper.calls, 1)
 
-    def test_tidyroom_first_empty_scene_turns_without_retry_or_vlm(self) -> None:
+    def test_tidyroom_first_empty_scene_waits_once_then_turns_without_vlm(self) -> None:
         class FirstFrameMapper:
             def __init__(self) -> None:
                 self.calls: list[dict] = []
@@ -429,14 +512,52 @@ class TaskRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result["action"], "turn_in_degree")
         self.assertEqual(result["result"], "success")
-        sleep_mock.assert_not_called()
+        self.assertEqual(sleep_mock.call_args_list, [call(0.75)])
         self.assertEqual(len(agent.semantic_mapper.calls), 1)
-        self.assertFalse(agent.semantic_mapper.calls[0]["include_images"])
+        self.assertTrue(agent.semantic_mapper.calls[0].get("include_images", True))
         self.assertEqual(agent.vlm_client.calls, 0)
-        self.assertTrue(agent._task_strategy._second_frame_vlm_pending)
-        self.assertEqual(agent._task_strategy.scanner.turns_completed, 1)
+        self.assertFalse(agent._task_strategy._second_frame_vlm_pending)
+        self.assertEqual(agent._task_strategy.scanner.turns_completed, 0)
 
-    def test_tidyroom_first_nonempty_scene_without_pair_turns_without_vlm(self) -> None:
+    def test_tidyroom_unified_readiness_accepts_small_valid_view_but_rejects_black(self) -> None:
+        consistent, reason, _, threshold = PreliminaryBaselineAgent._tidyroom_perception_is_consistent(
+            {
+                "source": "unified",
+                "visible_object_count": 10,
+                "image_present": True,
+                "right_nonblack_ratio": 0.75,
+                "left_right_difference_ratio": 0.75,
+            }
+        )
+        self.assertTrue(consistent)
+        self.assertEqual(reason, "unified_perception_ready")
+        self.assertEqual(threshold, 1)
+
+        consistent, reason, _, _ = PreliminaryBaselineAgent._tidyroom_perception_is_consistent(
+            {
+                "source": "unified",
+                "visible_object_count": 36,
+                "image_present": True,
+                "right_nonblack_ratio": 0.0,
+                "left_right_difference_ratio": 0.75,
+            }
+        )
+        self.assertFalse(consistent)
+        self.assertEqual(reason, "unified_segmentation_black")
+
+        consistent, reason, _, _ = PreliminaryBaselineAgent._tidyroom_perception_is_consistent(
+            {
+                "source": "unified",
+                "visible_object_count": 3,
+                "image_present": True,
+                "right_nonblack_ratio": 0.99,
+                "left_right_difference_ratio": 0.02,
+            }
+        )
+        self.assertFalse(consistent)
+        self.assertEqual(reason, "unified_segmentation_still_rgb")
+
+    def test_tidyroom_first_nonempty_scene_waits_without_changing_heading(self) -> None:
         lightweight_details = [{"object_id": "1", "shape": "unrelated-chair"}]
 
         class NoPairMapper:
@@ -474,91 +595,22 @@ class TaskRuntimeTests(unittest.TestCase):
             )
 
         self.assertEqual(result["action"], "turn_in_degree")
-        sleep_mock.assert_not_called()
+        self.assertEqual(sleep_mock.call_args_list, [call(0.75)])
         self.assertEqual(len(agent.semantic_mapper.calls), 1)
-        self.assertFalse(agent.semantic_mapper.calls[0]["include_images"])
+        self.assertTrue(agent.semantic_mapper.calls[0]["include_images"])
         self.assertEqual(agent.vlm_client.calls, 0)
-        self.assertTrue(agent._task_strategy._second_frame_vlm_pending)
-        self.assertEqual(agent._task_strategy.scanner.turns_completed, 1)
-
-    def test_tidyroom_second_frame_uses_one_full_same_frame_vlm_perception(self) -> None:
-        full_details = [{"object_id": "9", "shape": "cup", "frame_marker": "second-full-frame"}]
-
-        class SecondFrameMapper:
-            def __init__(self) -> None:
-                self.calls: list[dict] = []
-                self.object_id_map = {}
-
-            def get_perception_from_camera(self, **kwargs):
-                self.calls.append(dict(kwargs))
-                if len(self.calls) == 1:
-                    return None, [], []
-                return "second-full-image", [{"object_id": 9, "segmentation_id": 19}], full_details
-
-        class CapturingPromptGenerator:
-            def __init__(self) -> None:
-                self.variables = None
-                self.image = None
-
-            def Generate(self, *, variables, image, context_messages, last_json_parse_message):
-                del context_messages, last_json_parse_message
-                self.variables = variables
-                self.image = image
-                return [{"role": "user", "content": "second-frame-test"}]
-
-        class FakeResponse:
-            text = '[{"action":"turn_in_degree","parameters":{"degree":15},"output":0}]'
-            token_usage = None
-
-        class OneInvokeClient:
-            def __init__(self) -> None:
-                self.calls = 0
-
-            def invoke(self, messages):
-                del messages
-                self.calls += 1
-                return FakeResponse()
-
-        class SecondFrameAgent(PreliminaryBaselineAgent):
-            def _do_action(self, action):
-                return {
-                    "result": "success",
-                    "action": action["action"],
-                    "degree": (action.get("parameters") or {}).get("degree"),
-                }
-
-        agent = SecondFrameAgent(stub=None, channel=None)
-        agent._initialized = True
-        agent.semantic_mapper = SecondFrameMapper()
-        agent.prompt_generator = CapturingPromptGenerator()
-        agent.vlm_client = OneInvokeClient()
-        # 旧服务端会下发目标清单；只有拿得到清单，第二帧诊断才有可比对的物品。
-        subject = {
-            "task_type": "tidyroom",
-            "subject": "整理房间",
-            "movable_object_id": ["BP_Pillow_10_TEST"],
-        }
-
-        first_result = agent.run_step(subject, {})
-        second_result = agent.run_step(subject, {})
-
-        self.assertEqual(first_result["action"], "turn_in_degree")
-        self.assertEqual(second_result["action"], "turn_in_degree")
-        self.assertEqual(second_result["degree"], 45)
-        self.assertEqual(len(agent.semantic_mapper.calls), 2)
-        self.assertFalse(agent.semantic_mapper.calls[0]["include_images"])
-        self.assertTrue(agent.semantic_mapper.calls[1]["is_save"])
-        self.assertTrue(agent.semantic_mapper.calls[1].get("include_images", True))
-        self.assertTrue(agent.semantic_mapper.calls[1].get("include_object_details", True))
-        self.assertFalse(agent.semantic_mapper.calls[1].get("use_cached_details", False))
-        self.assertEqual(agent.prompt_generator.variables["visiable_objects_info"], full_details)
-        self.assertEqual(agent.prompt_generator.image, "data:image/jpeg;base64,second-full-image")
-        state = agent.prompt_generator.variables["task_strategy_state"]
-        self.assertEqual(state["vlm_reason"], "second_scene_diagnostic")
-        self.assertEqual(agent.vlm_client.calls, 1)
-        self.assertEqual(agent._task_strategy.vlm_call_count, 1)
         self.assertFalse(agent._task_strategy._second_frame_vlm_pending)
-        self.assertEqual(agent._task_strategy.scanner.turns_completed, 2)
+        self.assertEqual(agent._task_strategy.scanner.turns_completed, 0)
+
+    def test_tidyroom_second_frame_diagnostic_and_startup_scan_are_disabled(self) -> None:
+        strategy = TidyRoomStrategy()
+        strategy.reset({"task_type": "tidyroom", "subject": "整理房间"})
+        strategy._second_frame_vlm_pending = True
+
+        self.assertFalse(strategy.should_force_second_frame_vlm())
+        self.assertTrue(strategy.scanner.complete)
+        self.assertIsNone(strategy.scanner.next_action())
+        self.assertEqual(strategy.scanner.turns_required, 0)
 
     def test_tidyroom_without_a_target_list_skips_the_second_frame_vlm(self) -> None:
         """912 不下发清单时，第二帧问模型只会得到"继续转"，白白花掉一分多钟。"""
@@ -598,8 +650,8 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(agent.vlm_client.calls, 0)
         self.assertEqual(agent._task_strategy.vlm_call_count, 0)
         # 清单缺失时不再消耗这次诊断，但标记保持不变，等扫描完再一次性补充语义。
-        self.assertTrue(agent._task_strategy._second_frame_vlm_pending)
-        self.assertEqual(agent._task_strategy.scanner.turns_completed, 2)
+        self.assertFalse(agent._task_strategy._second_frame_vlm_pending)
+        self.assertEqual(agent._task_strategy.scanner.turns_completed, 0)
 
     def test_tidyroom_fast_loop_caches_task_service_data(self) -> None:
         agent = PreliminaryBaselineAgent(stub=None, channel=None)
@@ -691,7 +743,7 @@ class TaskRuntimeTests(unittest.TestCase):
         strategy.local_search_reason = "target_not_observed"
         strategy.note_forced_vlm("second_scene_diagnostic")
 
-        action = {"action": "turn_in_degree", "parameters": {"degree": 45}, "output": 0}
+        action = {"action": "turn_in_degree", "parameters": {"degree": 90}, "output": 0}
         validated = strategy.validate_action(action, None)
 
         self.assertEqual(validated, action)
@@ -699,7 +751,7 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(strategy.vlm_call_count, 1)
         self.assertIsNone(strategy.vlm_reason)
 
-    def test_second_scene_vlm_turn_is_normalized_to_scanner_angle(self) -> None:
+    def test_legacy_second_scene_reason_no_longer_rewrites_turn_angle(self) -> None:
         strategy = TidyRoomStrategy()
         strategy.reset({"movable_object_id": []})
         strategy.note_forced_vlm("second_scene_diagnostic")
@@ -712,12 +764,12 @@ class TaskRuntimeTests(unittest.TestCase):
         }
         validated = strategy.validate_action(action, None)
 
-        self.assertEqual(validated["parameters"]["degree"], 45)
-        self.assertIn("VLM 原始角度：15°", validated["think"])
+        self.assertEqual(validated["parameters"]["degree"], 15)
+        self.assertEqual(validated["think"], "换一个方向观察。")
         self.assertEqual(action["parameters"]["degree"], 15)
         self.assertEqual(strategy.scanner.turns_completed, 0)
 
-    def test_tidyroom_searches_for_known_missing_target_without_vlm(self) -> None:
+    def test_tidyroom_missing_target_does_not_trigger_a_search_turn(self) -> None:
         raw_id = "BP_DrinkContainer_Can_07_TEST"
         strategy = TidyRoomStrategy()
         strategy.reset({"movable_object_id": [raw_id]})
@@ -735,23 +787,21 @@ class TaskRuntimeTests(unittest.TestCase):
 
         action = strategy.next_local_action(context)
 
-        self.assertEqual(action["action"], "turn_in_degree")
-        self.assertEqual(action["parameters"]["degree"], 45)
-        self.assertEqual(strategy.state_for_prompt()["vlm_call_count"], 0)
-        strategy.after_action(action, {"result": "success"}, context)
-        self.assertEqual(strategy.state_for_prompt()["local_search"]["turns_completed"], 1)
+        self.assertIsNone(action)
+        self.assertEqual(strategy.state_for_prompt()["vlm_call_count"], 1)
+        self.assertEqual(strategy.state_for_prompt()["local_search"]["turns_completed"], 0)
 
-    def test_tidyroom_new_mapping_does_not_reset_stationary_search_budget(self) -> None:
+    def test_tidyroom_local_search_is_disabled_in_single_frame_mode(self) -> None:
         strategy = TidyRoomStrategy()
         strategy.reset({"movable_object_id": ["BP_Fruit_Apple_01_TEST"]})
         strategy.scanner.turns_completed = strategy.scanner.turns_required
 
         first = strategy._next_local_search_action("target_not_observed")
-        strategy.after_action(first, {"result": "success"}, None)
         second = strategy._next_local_search_action("missing_destination:dining_table")
 
-        self.assertEqual(strategy.local_search_turns, 1)
-        self.assertIn("2/4", second["think"])
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(strategy.local_search_turns, 0)
 
     def test_tidyroom_held_item_is_not_interrupted_by_an_unobserved_target(self) -> None:
         held_raw_id = "BP_Garbage_Bag_TEST"
@@ -790,8 +840,8 @@ class TaskRuntimeTests(unittest.TestCase):
 
         action = strategy.next_local_action(context)
 
-        self.assertEqual(action["action"], "move_to_object")
-        self.assertEqual(action["parameters"]["object_id"], "8")
+        self.assertEqual(action["action"], "put_down_sth_to_location")
+        self.assertTrue(action["parameters"]["force_locate"])
         self.assertEqual(strategy.state_for_prompt()["vlm_call_count"], 0)
 
     def test_tidyroom_state_is_updated_after_successful_actions(self) -> None:
@@ -859,44 +909,23 @@ class TaskRuntimeTests(unittest.TestCase):
             raw_to_mapped_id={target_raw_id: "3", trash_raw_id: "8"},
         )
         strategy.observe(held_context)
-        approach_action = strategy.validate_action(
+        put_action = strategy.validate_action(
             {"action": "move_and_put_down", "parameters": {}, "output": 0}, held_context
         )
-        self.assertEqual(approach_action["action"], "move_to_object")
-        self.assertEqual(approach_action["parameters"]["object_id"], "8")
-        strategy.after_action(approach_action, {"success": True}, held_context)
-        put_action = strategy._put_action(strategy.active_plan, "测试可靠放置")
-        self.assertEqual(put_action["action"], "move_and_put_down_object_in_container")
-        self.assertEqual(put_action["parameters"], {"which_hand": 0})
-        strategy.after_action(put_action, {"success": True}, held_context)
+        self.assertEqual(put_action["action"], "put_down_sth_to_location")
+        self.assertTrue(put_action["parameters"]["force_locate"])
+        strategy.after_action(put_action, {"result": "success"}, held_context)
 
-        placed_aabb = {
-            "min": {"x": 810.0, "y": 260.0, "z": 10.0},
-            "max": {"x": 817.0, "y": 267.0, "z": 25.0},
-        }
-        verified_context = TaskContext(
-            task_type="tidyroom",
-            subject={},
-            task_response={},
-            visible_objects=[trash_info, floor_info, tv_stand_info],
-            object_in_hand=None,
-            movable_objects=[target_raw_id],
-            action_histories=[],
-            raw_to_mapped_id={target_raw_id: "3", trash_raw_id: "8"},
-            world_aabbs_by_raw_id={target_raw_id: placed_aabb, trash_raw_id: trash_info["world_aabb"]},
-        )
-        # 垃圾使用物理容器动作，第一帧只等待其落底，第二帧再做几何校验。
-        strategy.observe(verified_context)
-        self.assertEqual(strategy.state_for_prompt()["successful_verified_puts"], 0)
-        strategy.observe(verified_context)
+        # put_down_sth_to_location 按坐标强制放置：动作返回 success 就完成，
+        # 不再回读 AABB 做几何校验。
         state = strategy.state_for_prompt()
         self.assertEqual(state["successful_takes"], 1)
-        self.assertEqual(state["successful_verified_puts"], 1)
+        self.assertEqual(state["successful_puts"], 1)
         self.assertEqual(state["targets"][0]["status"], "done")
-        final_action = strategy.next_local_action(verified_context)
-        self.assertEqual(final_action["action"], "submit_answer")
+        self.assertEqual(strategy.scheduler.estimated_agent_xy, (629.0, 368.0))
+        self.assertEqual(strategy.next_local_action(held_context)["action"], "submit_answer")
 
-    def test_tidyroom_container_failure_uses_small_nudge_then_coordinate_fallback(self) -> None:
+    def test_tidyroom_trash_uses_direct_coordinate_placement(self) -> None:
         target_raw_id = "BP_Garbage_Bag_TEST"
         strategy = TidyRoomStrategy()
         strategy.reset({"movable_object_id": [target_raw_id]})
@@ -925,25 +954,14 @@ class TaskRuntimeTests(unittest.TestCase):
             "attempt": 0,
             "slot_index": 0,
             "last_failure": None,
-            "placement_approached": True,
         }
         strategy.planner.refresh_plan(strategy.active_plan, strategy.scene_anchors)
 
         first_put = strategy._put_action(strategy.active_plan, "测试容器动作")
-        strategy.after_action(first_put, {"result": "failed", "error": "no container found"}, None)
-        nudge = strategy._put_action(strategy.active_plan, "测试小幅调整")
-        self.assertEqual(nudge["action"], "move_forward")
-        self.assertEqual(nudge["parameters"]["distance"], 15.0)
-
-        strategy.after_action(nudge, {"result": "success"}, None)
-        second_put = strategy._put_action(strategy.active_plan, "测试第二次容器动作")
-        self.assertEqual(second_put["action"], "move_and_put_down_object_in_container")
-        strategy.after_action(second_put, {"result": "failed", "error": "no container found"}, None)
-
-        fallback = strategy._put_action(strategy.active_plan, "测试坐标回退")
-        self.assertEqual(fallback["action"], "put_down_to_location")
-        self.assertTrue(fallback["parameters"]["force_locate"])
-        self.assertFalse(fallback["parameters"]["disable_physics"])
+        # 四类目的地统一使用 force_locate 坐标放置。
+        self.assertEqual(first_put["action"], "put_down_sth_to_location")
+        self.assertIn("target_location", first_put["parameters"])
+        self.assertTrue(first_put["parameters"]["force_locate"])
 
     def test_tidyroom_computes_dining_table_coordinates_by_field_name(self) -> None:
         apple_raw_id = "BP_Fruit_Apple_01_TEST"
@@ -993,24 +1011,18 @@ class TaskRuntimeTests(unittest.TestCase):
         direct_put_action = strategy.validate_action(
             {"action": "move_and_put_down", "parameters": {}, "output": 0}, context
         )
-        self.assertEqual(direct_put_action["action"], "put_down_to_location")
-        self.assertTrue(direct_put_action["parameters"]["force_locate"])
+        self.assertEqual(direct_put_action["action"], "put_down_sth_to_location")
         put_location = direct_put_action["parameters"]["target_location"]
         self.assertEqual(put_location["X"], -217.0)
         self.assertEqual(put_location["Y"], 521.0)
         self.assertAlmostEqual(put_location["Z"], 80.757, places=3)
 
-        # 快速路径失败时不能原样循环，下一步恢复已验证的靠近后放置流程。
+        # 失败后更换规划槽位，再次调用同一个受支持接口。
         strategy.after_action(direct_put_action, {"result": "failed"}, context)
         fallback_action = strategy._put_action(strategy.active_plan, "直接放置失败后的回退")
-        self.assertEqual(fallback_action["action"], "move_to_location")
-        self.assertEqual(fallback_action["parameters"]["target_location"]["Z"], 0.0)
-        self.assertTrue(strategy.targets[apple_raw_id]["direct_force_place_disabled"])
-
-        # 即使延后目标并重建 plan，也不能重新开启已经失败的快速放置路径。
-        strategy.active_plan = None
-        rebuilt_plan = strategy._ensure_plan(apple_raw_id)
-        self.assertTrue(rebuilt_plan["direct_force_place_disabled"])
+        self.assertEqual(fallback_action["action"], "put_down_sth_to_location")
+        self.assertTrue(fallback_action["parameters"]["force_locate"])
+        self.assertIn("target_location", fallback_action["parameters"])
 
     def test_dining_table_height_does_not_depend_on_moved_target_aabb(self) -> None:
         planner = TidyRoomPlanner()
@@ -1067,116 +1079,101 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertFalse(result["valid"])
         self.assertEqual(result["reason"], "not_resting_in_container")
 
-    def test_tidyroom_defers_target_after_two_invalid_placements(self) -> None:
-        target_raw_id = "BP_Garbage_Bag_TEST"
-        trash_raw_id = "BP_TrashBin_01_TEST"
-        trash_aabb = {
-            "min": {"x": 800.0, "y": 253.0, "z": 3.0},
-            "max": {"x": 828.0, "y": 281.0, "z": 39.0},
-        }
-        strategy = TidyRoomStrategy()
-        strategy.reset({"movable_object_id": [target_raw_id]})
-        strategy.targets[target_raw_id]["object_id"] = "3"
-        strategy.active_plan = {
-            "target_raw_id": target_raw_id,
-            "target_object_id": "3",
-            "target_category": "garbage",
-            "target_info": {
+    def test_tidyroom_geometric_table_prefers_the_one_with_a_chair(self) -> None:
+        """标注不可信时按几何挑餐桌：旁边有椅子的那件才是餐桌。
+
+        实测：模型被要求"不要把椅子标成餐桌"，就把扶手椅标成了餐桌，物品穿过
+        "桌面"落到座面上。只按面积挑并不可靠（扶手椅 150x120 比餐桌 160x80 还
+        大），椅子是稳定得多的信号。
+        """
+        world = TidyRoomWorldModel({})
+        world.scene_objects = {
+            "12": {
+                "object_id": "12",
+                "shape": "rectangle",
                 "world_aabb": {
-                    "min": {"x": 700.0, "y": 200.0, "z": 3.0},
-                    "max": {"x": 708.0, "y": 208.0, "z": 20.0},
-                }
-            },
-            "destination_raw_id": trash_raw_id,
-            "destination_object_id": "8",
-            "destination_type": "trash_bin",
-            "destination_info": {"world_aabb": trash_aabb},
-            "attempt": 1,
-            "slot_index": 0,
-            "last_failure": None,
-        }
-        strategy.planner.refresh_plan(strategy.active_plan, strategy.scene_anchors)
-        strategy.awaiting_verification_raw_id = target_raw_id
-        strategy.placement_settle_waits = strategy._TRASH_SETTLE_OBSERVATIONS
-        strategy.recovery.record_failure(target_raw_id, "outside_xy")
-        context = TaskContext(
-            task_type="tidyroom",
-            subject={},
-            task_response={},
-            visible_objects=[],
-            object_in_hand=None,
-            movable_objects=[target_raw_id],
-            action_histories=[],
-            world_aabbs_by_raw_id={
-                target_raw_id: {
-                    "min": {"x": 700.0, "y": 200.0, "z": 3.0},
-                    "max": {"x": 708.0, "y": 208.0, "z": 20.0},
+                    "min": {"x": 486.0, "y": 530.0, "z": -0.5},
+                    "max": {"x": 636.0, "y": 650.0, "z": 83.4},
                 },
-                trash_raw_id: trash_aabb,
             },
-        )
-        strategy.observe(context)
-        self.assertIsNone(strategy.active_plan)
-        self.assertEqual(strategy.targets[target_raw_id]["status"], "pending")
-        self.assertEqual(strategy.recovery.total_failures[target_raw_id], 2)
-
-    def test_tidyroom_blocks_target_after_three_invalid_placements(self) -> None:
-        target_raw_id = "BP_DrinkContainer_Can_07_TEST"
-        table_raw_id = "BP_DiningTable_01_TEST"
-        table_aabb = {
-            "min": {"x": -297.0, "y": 481.0, "z": 3.0},
-            "max": {"x": -137.0, "y": 561.0, "z": 78.757},
+            "16": {
+                "object_id": "16",
+                "shape": "rectangle",
+                "world_aabb": {
+                    "min": {"x": -297.0, "y": 481.0, "z": 3.0},
+                    "max": {"x": -137.0, "y": 561.0, "z": 78.757},
+                },
+            },
         }
+        # 没有椅子信息时只能按面积挑：扶手椅更大就被选中。
+        self.assertEqual(world.geometric_candidates("dining_table")[0], "12")
+
+        world.scene_objects["21"] = {
+            "object_id": "21",
+            "shape": "chair",
+            "world_aabb": {
+                "min": {"x": -281.0, "y": 405.0, "z": 0.0},
+                "max": {"x": -195.0, "y": 485.0, "z": 80.1},
+            },
+        }
+        # 看到旁边的椅子之后，真正的餐桌排到前面。
+        self.assertEqual(world.geometric_candidates("dining_table")[0], "16")
+        self.assertEqual(world.promote_geometric_candidate("dining_table"), "16")
+        self.assertEqual(world.scene_anchors["16"]["type"], "dining_table")
+        self.assertEqual(world.scene_anchors["16"]["source"], "geometric_candidate")
+
+    def test_tidyroom_promotes_geometric_table_before_scheduler_gives_up(self) -> None:
+        """无餐桌 anchor 时先补建候选，不能让调度器返回空后直接 blocked。"""
         strategy = TidyRoomStrategy()
-        strategy.reset({"movable_object_id": [target_raw_id]})
-        strategy.targets[target_raw_id].update(
-            {"object_id": "21", "placement_verification_failures": 2}
-        )
-        strategy.active_plan = {
-            "target_raw_id": target_raw_id,
-            "target_object_id": "21",
-            "target_category": "drink_container",
-            "target_info": {},
-            "destination_raw_id": table_raw_id,
-            "destination_object_id": "34",
-            "destination_type": "dining_table",
-            "destination_info": {"world_aabb": table_aabb},
-            "support_region": {
-                "min_x": -280.0,
-                "max_x": -154.0,
-                "min_y": 493.0,
-                "max_y": 549.0,
-            },
-            "support_z": 78.757,
-            "attempt": 2,
-            "slot_index": 0,
-            "last_failure": None,
-        }
-        strategy.awaiting_verification_raw_id = target_raw_id
+        strategy.reset({"task_type": "tidyroom", "subject": "整理房间"})
         context = TaskContext(
             task_type="tidyroom",
             subject={},
             task_response={},
-            visible_objects=[],
-            object_in_hand=None,
-            movable_objects=[target_raw_id],
-            action_histories=[],
-            world_aabbs_by_raw_id={
-                target_raw_id: {
-                    "min": {"x": -220.0, "y": 515.0, "z": 96.0},
-                    "max": {"x": -214.0, "y": 527.0, "z": 112.0},
+            visible_objects=[
+                {
+                    "object_id": "32",
+                    "world_aabb": {
+                        "min": {"x": 500.0, "y": 220.0, "z": 2.0},
+                        "max": {"x": 508.0, "y": 228.0, "z": 18.0},
+                    },
                 },
-                table_raw_id: table_aabb,
-            },
+                {
+                    "object_id": "16",
+                    "shape": "rectangle",
+                    "world_aabb": {
+                        "min": {"x": -297.0, "y": 481.0, "z": 3.0},
+                        "max": {"x": -137.0, "y": 561.0, "z": 78.757},
+                    },
+                },
+                {
+                    "object_id": "21",
+                    "shape": "chair",
+                    "world_aabb": {
+                        "min": {"x": -281.0, "y": 405.0, "z": 0.0},
+                        "max": {"x": -195.0, "y": 485.0, "z": 80.1},
+                    },
+                },
+            ],
+            object_in_hand=None,
+            movable_objects=[],
+            action_histories=[],
+            raw_to_mapped_id={"32": "32", "unknown16": "16", "chair": "21"},
+        )
+        strategy.observe(context)
+        strategy.world.apply_semantic_hints(
+            {"object_id": "32", "semantic_label": "cup", "destination_type": "dining_table"},
+            context,
         )
 
-        strategy.observe(context)
+        action = strategy.next_local_action(context)
 
-        self.assertEqual(strategy.targets[target_raw_id]["status"], "blocked")
-        self.assertIsNone(strategy.active_plan)
-        self.assertEqual(strategy.next_local_action(context)["action"], "submit_answer")
+        self.assertEqual(action["action"], "move_and_take_object")
+        self.assertEqual(action["parameters"]["object_id"], "32")
+        self.assertEqual(strategy.active_plan["destination_object_id"], "16")
+        self.assertEqual(strategy.scene_anchors["16"]["source"], "geometric_candidate")
 
-    def test_tidyroom_uses_main_sofa_seat_instead_of_ottoman(self) -> None:
+    def test_tidyroom_places_bolster_on_main_sofa_seat_instead_of_ottoman(self) -> None:
         pillow_raw_id = "BP_Pillow_10_TEST"
         raw_to_mapped_id = {
             pillow_raw_id: "33",
@@ -1249,7 +1246,6 @@ class TaskRuntimeTests(unittest.TestCase):
         plan = strategy.state_for_prompt()["active_plan"]
         self.assertEqual(plan["destination_object_id"], "14")
         self.assertAlmostEqual(plan["support_z"], 44.252, places=2)
-        self.assertGreater(plan["move_target_location"]["X"], 338.406)
         self.assertGreaterEqual(plan["put_target_location"]["X"], (226.524 + 338.406) / 2.0)
 
     def test_tidyroom_pickup_requires_structured_hand_confirmation(self) -> None:
@@ -1274,6 +1270,71 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(state["successful_takes"], 0)
         self.assertEqual(state["pickup_verification_failures"], 1)
         self.assertEqual(state["targets"][0]["status"], "pending")
+
+    def test_tidyroom_server_not_pickup_blocks_target_immediately(self) -> None:
+        target_raw_id = "fixed-display-shoe"
+        strategy = TidyRoomStrategy()
+        strategy.reset({"movable_object_id": [target_raw_id]})
+        context = TaskContext(
+            task_type="tidyroom",
+            subject={},
+            task_response={},
+            visible_objects=[{"object_id": "10"}],
+            object_in_hand=None,
+            movable_objects=[target_raw_id],
+            action_histories=[],
+            raw_to_mapped_id={target_raw_id: "10"},
+        )
+        strategy.observe(context)
+
+        strategy.after_action(
+            {"action": "move_and_take_object", "parameters": {"object_id": "10"}},
+            {"result": "failed", "error": "can not take this object for not pickup"},
+            context,
+        )
+
+        self.assertEqual(strategy.targets[target_raw_id]["status"], "blocked")
+        self.assertEqual(strategy.targets[target_raw_id]["blocked_reason"], "server_not_pickup")
+        self.assertEqual(strategy.recovery.total_failures, {})
+
+    def test_action_parser_preserves_top_level_scene_annotations(self) -> None:
+        agent = PreliminaryBaselineAgent(stub=None, channel=None)
+        agent._task_strategy = TidyRoomStrategy()
+        agent._task_strategy.reset({"task_type": "tidyroom", "subject": "整理房间"})
+        raw_id = "33"
+        context = TaskContext(
+            task_type="tidyroom",
+            subject={},
+            task_response={},
+            visible_objects=[{"object_id": "33"}],
+            object_in_hand=None,
+            movable_objects=[],
+            action_histories=[],
+            raw_to_mapped_id={raw_id: "33"},
+        )
+        agent._task_context = context
+        agent._task_strategy.observe(context)
+
+        parsed = agent._parse_action_from_response(
+            [
+                {
+                    "action": "move_and_take_object",
+                    "parameters": {"object_id": "33", "which_hand": 0},
+                    "scene_annotations": [
+                        {
+                            "object_id": "33",
+                            "semantic_label": "cup",
+                            "destination_type": "dining_table",
+                        }
+                    ],
+                    "output": 0,
+                }
+            ]
+        )
+
+        self.assertIn("scene_annotations", parsed)
+        self.assertIn(raw_id, agent._task_strategy.targets)
+        self.assertEqual(agent._task_strategy.targets[raw_id]["destination_type"], "dining_table")
 
     def test_tidyroom_scans_locally_before_considering_vlm(self) -> None:
         strategy = TidyRoomStrategy()
@@ -1328,13 +1389,10 @@ class TaskRuntimeTests(unittest.TestCase):
 
         scanner_state = strategy.state_for_prompt()["scanner"]
         self.assertTrue(scanner_state["complete"])
-        self.assertTrue(scanner_state["finished_early"])
+        self.assertFalse(scanner_state["finished_early"])
         self.assertEqual(scanner_state["turns_completed"], 0)
-        self.assertEqual(scanner_state["turn_degrees"], 45)
-        self.assertEqual(
-            scanner_state["early_stop_reason"],
-            "all_targets_and_required_destinations_mapped",
-        )
+        self.assertEqual(scanner_state["turn_degrees"], 90)
+        self.assertIsNone(scanner_state["early_stop_reason"])
         self.assertFalse(strategy.needs_scene_perception())
 
     def test_tidyroom_processes_actionable_current_view_before_full_scan(self) -> None:
@@ -1372,7 +1430,7 @@ class TaskRuntimeTests(unittest.TestCase):
         )
 
         strategy.observe(context)
-        self.assertFalse(strategy.scanner.complete)
+        self.assertTrue(strategy.scanner.complete)
 
         action = strategy.next_local_action(context)
 
@@ -1538,6 +1596,9 @@ class TaskRuntimeTests(unittest.TestCase):
                     "destination_type": "sofa",
                     "front_side": "+x",
                     "move_target_location": {"X": 9999, "Y": 9999, "Z": 0},
+                    "scene_annotations": [
+                        {"anchor_object_id": "14", "destination_type": "sofa", "front_side": "+x"}
+                    ],
                 },
             },
             context,
@@ -1558,7 +1619,7 @@ class TaskRuntimeTests(unittest.TestCase):
             task_response={},
             visible_objects=[
                 {"object_id": "7", "world_aabb": {"min": {"x": 0, "y": 0, "z": 0}, "max": {"x": 8, "y": 8, "z": 4}}},
-                {"object_id": "9", "world_aabb": {"min": {"x": 20, "y": 20, "z": 0}, "max": {"x": 80, "y": 80, "z": 70}}},
+                {"object_id": "9", "world_aabb": {"min": {"x": 100, "y": 100, "z": 0}, "max": {"x": 260, "y": 180, "z": 70}}},
             ],
             object_in_hand=None,
             movable_objects=[target_raw_id],
@@ -1567,13 +1628,16 @@ class TaskRuntimeTests(unittest.TestCase):
         )
         world.observe(context)
 
-        world.apply_semantic_hints(
-            {
-                "object_id": "7",
-                "semantic_label": "Ceramic Plate",
-                "destination_object_id": "9",
-                "destination_type": "dining_table",
-            },
+        world.apply_scene_annotations(
+            [
+                {"anchor_object_id": "9", "destination_type": "dining_table"},
+                {
+                    "object_id": "7",
+                    "semantic_label": "Ceramic Plate",
+                    "destination_object_id": "9",
+                    "destination_type": "dining_table",
+                },
+            ],
             context,
         )
 

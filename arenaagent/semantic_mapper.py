@@ -243,9 +243,9 @@ class SemanticMapper:
     ) -> tuple[str | None, list[dict[str, Any]], list[dict[str, Any]]]:
         """把统一感知的响应整理成与分步采集一致的返回值。
 
-        服务端保证画面与物体列表同帧，并且自己完成了 ID 标注与拼接，因此这里不再
-        计算像素覆盖率。last_perception_diagnostics 留空，依赖它的两个一致性检查
-        会以 diagnostics_unavailable 放行，正好对应"服务端已保证同步"。
+        服务端负责同帧拼图，但场景刚加载或刚转向时可能返回“有 RGB、对象列表为空、
+        右半分割图全黑”的过渡帧。因此仍记录统一感知的最低限度就绪指标，交给任务
+        运行时决定是否重试。
         """
         raw_objects = [
             item
@@ -253,7 +253,40 @@ class SemanticMapper:
             if isinstance(item, dict) and item.get("object_id") is not None
         ]
         visible_objects = self.register_identity_ids(raw_objects)
-        self.last_perception_diagnostics = {}
+        image_b64 = perception.get("image")
+        decoded = self._decode_image(image_b64)
+        right_nonblack_ratio = 0.0
+        left_right_difference_ratio = 0.0
+        if decoded is not None and decoded.width >= 2:
+            pixels = np.asarray(decoded.convert("RGB"))
+            half_width = decoded.width // 2
+            left_half = pixels[:, :half_width]
+            right_half = pixels[:, half_width : half_width * 2]
+            if right_half.size:
+                right_nonblack_ratio = float(
+                    np.count_nonzero(np.max(right_half, axis=2) > 8)
+                    / (right_half.shape[0] * right_half.shape[1])
+                )
+                # 正常右半图是伪彩色分割图，绝大多数像素都应与同位置 RGB
+                # 明显不同。服务端未就绪时右半图会直接复制 RGB，只给 NPC
+                # 上色；仅看“非黑像素”无法识别这种坏帧。
+                pixel_delta = np.max(
+                    np.abs(left_half.astype(np.int16) - right_half.astype(np.int16)),
+                    axis=2,
+                )
+                left_right_difference_ratio = float(
+                    np.count_nonzero(pixel_delta > 24) / pixel_delta.size
+                )
+        self.last_perception_diagnostics = {
+            "source": "unified",
+            "visible_object_count": len(visible_objects),
+            "visible_object_ids": tuple(
+                sorted(str(item["object_id"]) for item in visible_objects)
+            ),
+            "image_present": decoded is not None,
+            "right_nonblack_ratio": right_nonblack_ratio,
+            "left_right_difference_ratio": left_right_difference_ratio,
+        }
 
         visible_objects_info: list[dict[str, Any]] = []
         if include_object_details:
@@ -271,13 +304,11 @@ class SemanticMapper:
         if not include_images:
             return None, visible_objects, visible_objects_info
 
-        image_b64 = perception.get("image")
         if not image_b64:
             logger.warning("unified perception returned no image: {}", perception.get("error"))
             return None, visible_objects, visible_objects_info
 
         if is_save:
-            decoded = self._decode_image(image_b64)
             if decoded is not None:
                 self._save_image(decoded, log_dir=log_dir, save_label=save_label)
 

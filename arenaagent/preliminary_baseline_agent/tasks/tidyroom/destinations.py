@@ -49,7 +49,9 @@ def infer_target_category(raw_id: str) -> str:
 def recommended_destination(category: str) -> str | None:
     """从已知或开放式语义标签推导目的地，无法确定时返回 None。"""
     label = normalize_semantic_label(category) or ""
-    if label in {"pillow", "cushion", "bolster"}:
+    if label in {"pillow", "cushion", "bolster"} or any(
+        word in label for word in ("pillow", "cushion")
+    ):
         return "sofa"
     if label in {"shoe", "shoes", "slipper", "slippers", "sneaker", "sneakers", "boot", "boots"}:
         return "shoe_storage"
@@ -62,11 +64,15 @@ def recommended_destination(category: str) -> str | None:
         "cup",
         "mug",
         "bottle",
+        "can",
+        "drink_can",
         "tableware",
         "food",
         "fruit",
         "snack",
         "meal",
+        "walnut",
+        "nuts",
     } or label.startswith(("food_", "fruit_", "drink_", "beverage_")):
         return "dining_table"
     return None

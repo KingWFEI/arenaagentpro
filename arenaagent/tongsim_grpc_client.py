@@ -343,16 +343,12 @@ class TongSimGrpcClient(TongSimInterface):
             },
         )
 
-    def move_to_npc(self, character_id, npc_name: str) -> dict[str, Any] | None:
-        """Walk to an NPC by asset name. None when the server predates the RPC.
-
-        Older servers only expose get_object_id_by_name, so the caller resolves the
-        NPC to an object and moves there instead.
-        """
+    def move_to_npc(self, character_id, asset_name: str) -> dict[str, Any] | None:
+        """Use the competition server's legacy NPC movement RPC when available."""
         try:
             return self._call_dynamic(
                 "move_to_npc",
-                {"character_id": str(character_id), "npc_name": str(npc_name)},
+                {"character_id": str(character_id), "name": str(asset_name)},
             )
         except grpc.RpcError as exc:
             if exc.code() != grpc.StatusCode.UNIMPLEMENTED:

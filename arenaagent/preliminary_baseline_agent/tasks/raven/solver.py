@@ -299,6 +299,7 @@ class HybridRavenSolver:
         legacy_ranked: list[list[int]] | None = None,
         rejected_triples: list[list[int]] | None = None,
         previous_attempts: list[dict[str, Any]] | None = None,
+        whole_image: Image.Image | None = None,
     ) -> HybridRavenResult:
         if len(image_groups) != 3:
             raise ValueError(f"Competition Raven canvas must contain three questions, got {len(image_groups)}")
@@ -326,19 +327,18 @@ class HybridRavenSolver:
 
         prior_visual_votes: list[ModelVote] = []
         target_questions = [1, 2, 3]
-        reasoning_mode = "initial_parallel"
+        reasoning_mode = "whole_image_single_request"
         if rejected_triples and previous_attempts:
             prior_visual_votes = restore_prior_model_votes(previous_attempts)
             if prior_visual_votes:
-                target_questions = select_suspect_questions(previous_attempts)
-                reasoning_mode = "targeted_parallel_revision"
+                reasoning_mode = "whole_image_single_revision"
 
         visual_votes: list[ModelVote] = list(prior_visual_votes)
         visual_raw = ""
         if self.vlm_client is not None and _enabled("RAVEN_ENABLE_VLM"):
             try:
                 logger.info(
-                    "Raven {}: dispatching independent VLM requests for questions {}",
+                    "Raven {}: dispatching one K3 request with the original canvas for questions {}",
                     reasoning_mode,
                     target_questions,
                 )
@@ -348,6 +348,7 @@ class HybridRavenSolver:
                     deterministic,
                     correction_context=correction_context,
                     target_questions=target_questions,
+                    whole_image=whole_image,
                 )
                 revised_by_question = {vote.question: vote for vote in revised_votes}
                 prior_by_question = {vote.question: vote for vote in prior_visual_votes}
@@ -378,7 +379,7 @@ class HybridRavenSolver:
             question for question in range(1, 4) if _vote_for_question(visual_votes, question) is None
         ]
         verification_targets = missing_visual_questions
-        if not verification_targets and reasoning_mode == "targeted_parallel_revision":
+        if not verification_targets and reasoning_mode == "whole_image_single_revision":
             verification_targets = target_questions
         needs_text_verifier = bool(verification_targets)
         text_votes: list[ModelVote] = []
@@ -414,6 +415,45 @@ class HybridRavenSolver:
             for index in range(3)
         ]
         selected = verify_selected_answers([question.answer for question in final_questions])
+        conservative_overrides: list[dict[str, Any]] = []
+        if not rejected_triples and legacy_scores:
+            try:
+                override_threshold = float(os.getenv("RAVEN_VLM_OVERRIDE_CONFIDENCE", "0.85"))
+            except ValueError:
+                override_threshold = 0.85
+            override_threshold = max(0.0, min(override_threshold, 1.0))
+            for index in range(3):
+                legacy_answer = int(np.argmax(np.asarray(legacy_scores[index]))) + 1
+                if selected[index] == legacy_answer:
+                    continue
+                visual_vote = _vote_for_question(visual_votes, index + 1)
+                rule_answer = int(np.argmax(np.asarray(rule_results[index].scores))) + 1
+                visual_can_override = bool(
+                    visual_vote is not None
+                    and visual_vote.answer == selected[index]
+                    and rule_answer == selected[index]
+                    and visual_vote.confidence >= override_threshold
+                )
+                if not visual_can_override:
+                    conservative_overrides.append(
+                        {
+                            "question": index + 1,
+                            "fused_answer": selected[index],
+                            "legacy_answer": legacy_answer,
+                            "visual_answer": visual_vote.answer if visual_vote else None,
+                            "visual_confidence": visual_vote.confidence if visual_vote else None,
+                            "rule_answer": rule_answer,
+                        }
+                    )
+                    selected[index] = legacy_answer
+        visual_fallback_to_legacy = False
+        if not visual_votes and not text_votes and legacy_ranked:
+            # A quota, timeout or malformed response is absence of visual
+            # evidence, not evidence against the legacy model.  Preserve the
+            # old model's first choice instead of allowing weak CV rules to
+            # silently change an otherwise valid first submission.
+            selected = verify_selected_answers(list(legacy_ranked[0]))
+            visual_fallback_to_legacy = True
         rejected_set = {tuple(item) for item in (rejected_triples or [])}
         selection_rejected = tuple(selected) in rejected_set
         # Do not walk a 512-combination leaderboard after rejection. A new
@@ -444,6 +484,8 @@ class HybridRavenSolver:
             "text_verifier_questions": verification_targets if self.text_client is not None else [],
             "text_votes": [self._vote_summary(vote) for vote in text_votes],
             "selection_rejected": selection_rejected,
+            "visual_fallback_to_legacy": visual_fallback_to_legacy,
+            "conservative_legacy_restores": conservative_overrides,
             "visual_raw_excerpt": visual_raw[:1000],
             "text_raw_excerpt": text_raw[:1000],
             "rejected_triples": rejected_triples or [],

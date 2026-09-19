@@ -151,6 +151,84 @@ def parse_model_votes(text: str, expected_questions: int = 3) -> list[ModelVote]
     return []
 
 
+def _direct_answer_sequence(value: Any, expected_questions: int) -> list[int]:
+    if isinstance(value, (list, tuple)) and len(value) == expected_questions:
+        answers = [_answer_number(item) for item in value]
+        return [int(answer) for answer in answers] if all(answer is not None for answer in answers) else []
+    if not isinstance(value, str):
+        return []
+    stripped = value.strip()
+    patterns = (
+        rf"[1-8](?:\s*[,，、/|]\s*[1-8]){{{expected_questions - 1}}}",
+        rf"[1-8](?:\s+[1-8]){{{expected_questions - 1}}}",
+        rf"[1-8]{{{expected_questions}}}",
+    )
+    if not any(re.fullmatch(pattern, stripped) for pattern in patterns):
+        return []
+    answers = [int(value) for value in re.findall(r"[1-8]", stripped)]
+    return answers if len(answers) == expected_questions else []
+
+
+def parse_direct_model_votes(
+    text: str,
+    expected_questions: int = 3,
+    confidence: float = 0.90,
+) -> list[ModelVote]:
+    """Parse K3's concise whole-canvas answer without accepting numbers from prose."""
+    structured = parse_model_votes(text, expected_questions=expected_questions)
+    if structured:
+        return structured
+
+    answers: list[int] = []
+    for payload in _json_payloads(text or ""):
+        if isinstance(payload, dict):
+            for key in ("answers", "answer", "final_answer"):
+                answers = _direct_answer_sequence(payload.get(key), expected_questions)
+                if answers:
+                    break
+        else:
+            answers = _direct_answer_sequence(payload, expected_questions)
+        if answers:
+            break
+
+    if not answers:
+        sequence = (
+            rf"(?:[1-8](?:\s*[,，、/|]\s*[1-8]){{{expected_questions - 1}}}"
+            rf"|[1-8](?:\s+[1-8]){{{expected_questions - 1}}}"
+            rf"|[1-8]{{{expected_questions}}})"
+        )
+        labelled = re.findall(
+            rf"(?:最终答案|答案)\s*[:：]\s*({sequence})",
+            text or "",
+            flags=re.IGNORECASE,
+        )
+        if labelled:
+            answers = _direct_answer_sequence(labelled[-1], expected_questions)
+
+    if not answers:
+        plain = (text or "").strip().strip("`*_")
+        answers = _direct_answer_sequence(plain, expected_questions)
+    if not answers:
+        return []
+
+    selected_confidence = _clamp_confidence(confidence, default=0.90)
+    remainder = (1.0 - selected_confidence) / 7.0
+    return [
+        ModelVote(
+            question=question,
+            answer=answer,
+            confidence=selected_confidence,
+            candidate_confidences={
+                candidate: selected_confidence if candidate == answer else remainder
+                for candidate in range(1, 9)
+            },
+            rule="K3 whole-image direct answer",
+            evidence=["Original canvas containing all three questions"],
+        )
+        for question, answer in enumerate(answers, start=1)
+    ]
+
+
 def parse_single_model_vote(text: str, question: int) -> ModelVote | None:
     """Parse one independently requested question while preserving its global ID."""
     if not 1 <= question <= 3:

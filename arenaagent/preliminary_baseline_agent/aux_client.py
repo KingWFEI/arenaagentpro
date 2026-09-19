@@ -18,6 +18,8 @@ def build_aux_client_from_env(
     default_api_base: str,
     default_timeout_seconds: float = 35.0,
     api_key_fallbacks: tuple[str, ...] = (),
+    preferred_api_key_env: str | None = None,
+    chat_completion_kwargs: dict[str, Any] | None = None,
 ) -> Any | None:
     """Build an independent OpenAI-compatible client from <prefix>_* env vars.
 
@@ -28,13 +30,23 @@ def build_aux_client_from_env(
         logger.info("{} is disabled by environment", label)
         return None
 
-    api_key = os.getenv(f"{prefix}_API_KEY", "").strip()
+    api_key = (
+        os.getenv(preferred_api_key_env, "").strip()
+        if preferred_api_key_env
+        else ""
+    )
+    if not api_key:
+        api_key = os.getenv(f"{prefix}_API_KEY", "").strip()
     for fallback in api_key_fallbacks:
         if api_key:
             break
         api_key = os.getenv(fallback, "").strip()
     if not api_key:
-        hint = ", ".join((f"{prefix}_API_KEY", *api_key_fallbacks))
+        hint = ", ".join(
+            key
+            for key in (preferred_api_key_env, f"{prefix}_API_KEY", *api_key_fallbacks)
+            if key
+        )
         logger.info("{} is not configured; set {}", label, hint)
         return None
 
@@ -57,6 +69,7 @@ def build_aux_client_from_env(
     cfg.message_role = "user"
     cfg.request_timeout_seconds = timeout_seconds
     cfg.native_max_retries = 0
+    cfg.chat_completion_kwargs = dict(chat_completion_kwargs or {})
     client = ClientFactory().build("openai", cfg)
     logger.info(
         "Configured {} model={} api_base={} timeout={}s",

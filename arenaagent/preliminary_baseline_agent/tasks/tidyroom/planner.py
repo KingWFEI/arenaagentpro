@@ -6,35 +6,14 @@ from typing import Any
 
 from arenaagent.preliminary_baseline_agent.tasks.tidyroom.geometry import (
     center_xy,
-    contains_xy,
-    expanded_contains_xy,
     horizontal_area,
-    is_floor_region,
     normalize_aabb,
     normalize_location,
 )
 
-APPROACH_CLEARANCE = 60.0
-FLOOR_SAFETY_MARGIN = 25.0
-OBSTACLE_CLEARANCE = 35.0
-MIN_BLOCKING_OBJECT_HEIGHT = 15.0
-
 
 class TidyRoomPlanner:
-    """根据家具、地板和障碍物 AABB 计算可达接近点与放置点。"""
-
-    def __init__(self) -> None:
-        self.scene_objects: dict[str, dict[str, Any]] = {}
-        self.floor_regions: dict[str, dict[str, Any]] = {}
-
-    def observe(self, visible_objects: list[dict[str, Any]]) -> None:
-        for item in visible_objects:
-            object_id = str(item.get("object_id") or "")
-            if not object_id:
-                continue
-            self.scene_objects[object_id] = deepcopy(item)
-            if is_floor_region(item):
-                self.floor_regions[object_id] = deepcopy(item)
+    """由家具 AABB 计算强制坐标放置点。"""
 
     def build_plan(
         self,
@@ -73,10 +52,9 @@ class TidyRoomPlanner:
             plan["front_side"] = anchor["front_side"]
         destination_type = str(plan.get("destination_type") or "")
         if destination_type == "sofa":
-            move_location, put_location, support_region, support_z = self._plan_sofa(plan, anchors)
+            put_location, support_region, support_z = self._plan_sofa(plan, anchors)
         else:
-            move_location, put_location, support_region, support_z = self._plan_flat_destination(plan)
-        plan["move_target_location"] = move_location
+            put_location, support_region, support_z = self._plan_flat_destination(plan)
         plan["put_target_location"] = put_location
         plan["support_region"] = support_region
         plan["support_z"] = support_z
@@ -111,7 +89,7 @@ class TidyRoomPlanner:
     def _plan_flat_destination(
         self,
         plan: dict[str, Any],
-    ) -> tuple[dict[str, float], dict[str, float], dict[str, float], float]:
+    ) -> tuple[dict[str, float], dict[str, float], float]:
         destination_info = plan.get("destination_info") or {}
         target_info = plan.get("target_info") or {}
         destination_aabb = normalize_aabb(destination_info.get("world_aabb"))
@@ -124,7 +102,7 @@ class TidyRoomPlanner:
                 "min_y": fallback["Y"],
                 "max_y": fallback["Y"],
             }
-            return fallback, fallback, empty_region, fallback["Z"]
+            return fallback, empty_region, fallback["Z"]
 
         minimum, maximum = destination_aabb
         target_half_x, target_half_y = self._target_half_extents(target_aabb)
@@ -147,9 +125,8 @@ class TidyRoomPlanner:
             support_z = maximum["z"]
 
         if destination_type == "trash_bin":
-            # 垃圾桶空间较窄，两件罐子不能使用“中心 + 轻微偏移”，否则刚体
-            # 会相互重叠。直接分配左右两个间距更大的桶内槽位。
-            put_x, put_y = self._container_slot_point(
+            # 垃圾桶空间较窄，多件物品分配不同落点，减少刚体重叠。
+            put_x, put_y = self._trash_bin_slot_point(
                 region,
                 int(plan.get("slot_index", 0)),
                 int(plan.get("attempt", 0)),
@@ -161,21 +138,13 @@ class TidyRoomPlanner:
                 int(plan.get("attempt", 0)),
             )
         put_z = self._put_origin_z(plan, target_aabb, support_z, destination_aabb)
-        destination_center = ((minimum["x"] + maximum["x"]) / 2.0, (minimum["y"] + maximum["y"]) / 2.0)
-        move_location = self._reachable_approach(
-            destination_aabb,
-            destination_center,
-            str(plan.get("destination_object_id") or ""),
-            str(plan.get("target_object_id") or ""),
-            int(plan.get("attempt", 0)),
-        )
-        return move_location, {"X": put_x, "Y": put_y, "Z": put_z}, region, support_z
+        return {"X": put_x, "Y": put_y, "Z": put_z}, region, support_z
 
     def _plan_sofa(
         self,
         plan: dict[str, Any],
         anchors: dict[str, dict[str, Any]],
-    ) -> tuple[dict[str, float], dict[str, float], dict[str, float], float]:
+    ) -> tuple[dict[str, float], dict[str, float], float]:
         destination_info = plan.get("destination_info") or {}
         target_info = plan.get("target_info") or {}
         destination_aabb = normalize_aabb(destination_info.get("world_aabb"))
@@ -187,7 +156,6 @@ class TidyRoomPlanner:
         width_x = maximum["x"] - minimum["x"]
         width_y = maximum["y"] - minimum["y"]
         depth_axis = "x" if width_x <= width_y else "y"
-        long_axis = "y" if depth_axis == "x" else "x"
         sofa_center = ((minimum["x"] + maximum["x"]) / 2.0, (minimum["y"] + maximum["y"]) / 2.0)
         reference_center = self._nearest_reference_center("coffee_table", anchors, sofa_center)
         front_sign = self._front_sign_from_hint(str(plan.get("front_side") or ""), depth_axis)
@@ -205,93 +173,7 @@ class TidyRoomPlanner:
         put_x, put_y = self._slot_point(region, int(plan.get("slot_index", 0)), int(plan.get("attempt", 0)))
         support_z = minimum["z"] + 0.45 * (maximum["z"] - minimum["z"])
         put_z = self._put_origin_z(plan, target_aabb, support_z, destination_aabb)
-
-        long_coordinate = put_y if long_axis == "y" else put_x
-        if depth_axis == "x":
-            approach_x = maximum["x"] + APPROACH_CLEARANCE if front_sign > 0 else minimum["x"] - APPROACH_CLEARANCE
-            approach = {"X": approach_x, "Y": long_coordinate, "Z": 0.0}
-        else:
-            approach_y = maximum["y"] + APPROACH_CLEARANCE if front_sign > 0 else minimum["y"] - APPROACH_CLEARANCE
-            approach = {"X": long_coordinate, "Y": approach_y, "Z": 0.0}
-        attempt = int(plan.get("attempt", 0))
-        if attempt > 0 or not self._is_reachable_point(
-            approach,
-            str(plan.get("destination_object_id") or ""),
-            "",
-        ):
-            approach = self._reachable_approach(
-                destination_aabb,
-                sofa_center,
-                str(plan.get("destination_object_id") or ""),
-                str(plan.get("target_object_id") or ""),
-                attempt,
-            )
-        return approach, {"X": put_x, "Y": put_y, "Z": put_z}, region, support_z
-
-    def _reachable_approach(
-        self,
-        destination_aabb: tuple[dict[str, float], dict[str, float]],
-        destination_center: tuple[float, float],
-        destination_object_id: str,
-        target_object_id: str,
-        attempt: int = 0,
-    ) -> dict[str, float]:
-        minimum, maximum = destination_aabb
-        center_x, center_y = destination_center
-        candidates = (
-            {"X": minimum["x"] - APPROACH_CLEARANCE, "Y": center_y, "Z": 0.0},
-            {"X": maximum["x"] + APPROACH_CLEARANCE, "Y": center_y, "Z": 0.0},
-            {"X": center_x, "Y": minimum["y"] - APPROACH_CLEARANCE, "Z": 0.0},
-            {"X": center_x, "Y": maximum["y"] + APPROACH_CLEARANCE, "Z": 0.0},
-        )
-        valid = [
-            point
-            for point in candidates
-            if self._is_reachable_point(point, destination_object_id, target_object_id)
-        ]
-        if not valid:
-            valid = [
-                point
-                for point in candidates
-                if self._inside_destination_floor(point["X"], point["Y"], margin=10.0)
-            ]
-        if not valid:
-            return {"X": center_x, "Y": center_y, "Z": 0.0}
-        floor_center = self._destination_floor_center(center_x, center_y)
-        if floor_center is not None:
-            valid.sort(key=lambda point: hypot(point["X"] - floor_center[0], point["Y"] - floor_center[1]))
-        # 每次失败轮换一个已验证的接近点，避免在墙边重复同一路径。
-        return valid[attempt % len(valid)]
-
-    def _is_reachable_point(self, point: dict[str, float], destination_id: str, target_id: str) -> bool:
-        if not self._inside_destination_floor(point["X"], point["Y"], FLOOR_SAFETY_MARGIN):
-            return False
-        ignored_ids = set(self.floor_regions) | {destination_id, target_id}
-        for object_id, info in self.scene_objects.items():
-            if object_id in ignored_ids or is_floor_region(info):
-                continue
-            aabb = normalize_aabb(info.get("world_aabb"))
-            if aabb is None or aabb[1]["z"] < MIN_BLOCKING_OBJECT_HEIGHT:
-                continue
-            if expanded_contains_xy(aabb, point["X"], point["Y"], OBSTACLE_CLEARANCE):
-                return False
-        return True
-
-    def _inside_destination_floor(self, x_value: float, y_value: float, margin: float) -> bool:
-        return any(
-            contains_xy(info.get("world_aabb"), x_value, y_value, margin)
-            for info in self.floor_regions.values()
-        )
-
-    def _destination_floor_center(self, x_value: float, y_value: float) -> tuple[float, float] | None:
-        containing = [
-            info
-            for info in self.floor_regions.values()
-            if contains_xy(info.get("world_aabb"), x_value, y_value)
-        ]
-        if not containing:
-            return None
-        return center_xy(max(containing, key=lambda info: horizontal_area(info.get("world_aabb"))).get("world_aabb"))
+        return {"X": put_x, "Y": put_y, "Z": put_z}, region, support_z
 
     @staticmethod
     def _sofa_seat_region(  # noqa: PLR0917
@@ -370,7 +252,7 @@ class TidyRoomPlanner:
         return center_x + x_factor * width, center_y + y_factor * depth
 
     @staticmethod
-    def _container_slot_point(region: dict[str, float], slot_index: int, attempt: int) -> tuple[float, float]:
+    def _trash_bin_slot_point(region: dict[str, float], slot_index: int, attempt: int) -> tuple[float, float]:
         center_x = (region["min_x"] + region["max_x"]) / 2.0
         center_y = (region["min_y"] + region["max_y"]) / 2.0
         width = max(region["max_x"] - region["min_x"], 0.0)

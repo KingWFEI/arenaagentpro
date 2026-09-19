@@ -62,6 +62,11 @@ class VLMAgent(AgentBase):
             sleep_between_steps=sleep_between_steps,
         )
         self._initialized = False
+        # 912 赛题服务器收到 close RPC 后会重建整个 TongSim runtime。
+        # 多题任务中每题都 close 会反复关闭/创建 gRPC aio event loop，
+        # 最终导致 PollerCompletionQueue 访问已关闭的 loop。多轮运行时
+        # builder 会把同一个客户端传给新 Agent，并在全部轮次后只关闭一次。
+        self._close_tongsim_on_deinit = True
 
         self.vlm_client = None
         self.tongsim: TongSimInterface = None
@@ -102,20 +107,49 @@ class VLMAgent(AgentBase):
         )
         self.vlm_client = ClientFactory().build(self.cfg.vlm_config.client_type, self.cfg.vlm_config.client_cfg)
 
-        tongsim_server_endpoint = opt.get("tongsim_server_endpoint") or self.cfg.tongsim_server_endpoint
-        self.tongsim = TongSimGrpcClient(endpoint=tongsim_server_endpoint)
+        skip_character = bool(getattr(self, "_skip_tongsim_character_init", False))
+        if not skip_character:
+            if self.tongsim is None:
+                tongsim_server_endpoint = opt.get("tongsim_server_endpoint") or self.cfg.tongsim_server_endpoint
+                self.tongsim = TongSimGrpcClient(endpoint=tongsim_server_endpoint)
 
-        spawn_loc = json.loads(opt["spawn_loc"])
-        spawn_rot = json.loads(opt["spawn_rot"])
-        camera_fov = float(opt.get("camera_fov", 120.0))
-        camera_width = int(opt.get("camera_width", 1280))
-        camera_height = int(opt.get("camera_height", 720))
-        self.character_id = self.tongsim.spawn_character(
-            self.cfg.agent_body_asset_name, spawn_loc, spawn_rot, opt["name"], camera_fov, camera_width, camera_height
-        )
+            spawn_loc = json.loads(opt["spawn_loc"])
+            spawn_rot = json.loads(opt["spawn_rot"])
+            camera_fov = float(opt.get("camera_fov", 120.0))
+            camera_width = int(opt.get("camera_width", 1280))
+            camera_height = int(opt.get("camera_height", 720))
+            self.character_id = self.tongsim.spawn_character(
+                self.cfg.agent_body_asset_name,
+                spawn_loc,
+                spawn_rot,
+                opt["name"],
+                camera_fov,
+                camera_width,
+                camera_height,
+            )
+            self.semantic_mapper = SemanticMapper(self.tongsim, self.character_id, log_dir=self.cfg.log_dir)
+        else:
+            # Raven receives its complete PNG through Arena's subject payload. Spawning
+            # a rendered TongSim character takes about 29 seconds and contributes no
+            # evidence, while the scored clock starts before that RPC returns.
+            self.character_id = None
+            self.semantic_mapper = None
+            logger.info("Skipping TongSim character spawn for image-only task")
+
         self.prompt_generator = PromptGenerator(self.cfg.vlm_config.prompt_config)
-        self.semantic_mapper = SemanticMapper(self.tongsim, self.character_id, log_dir=self.cfg.log_dir)
         self._initialized = True
+
+    def configure_shared_tongsim(self, client: TongSimInterface | None) -> None:
+        """Keep one TongSim runtime alive across a multi-subject task.
+
+        ``None`` on the first subject means init() should create the client, while
+        later subjects receive that same client.  In both cases deinit() only
+        releases the per-subject character; builder closes the shared client once
+        after every requested run has completed.
+        """
+        self._close_tongsim_on_deinit = False
+        if client is not None:
+            self.tongsim = client
 
     def deinit(self):
         self._cleanup_raven_temp_images()
@@ -129,11 +163,14 @@ class VLMAgent(AgentBase):
                     self.tongsim.destory_character(self.character_id)
                 except Exception as exc:
                     logger.warning("Failed to destroy character {}: {}", self.character_id, exc)
-            try:
-                self.tongsim.close()
-                logger.info("Released TongSim resources for character {}", self.character_id)
-            except Exception as exc:
-                logger.warning("Failed to release TongSim resources for {}: {}", self.character_id, exc)
+            if self._close_tongsim_on_deinit:
+                try:
+                    self.tongsim.close()
+                    logger.info("Released TongSim resources for character {}", self.character_id)
+                except Exception as exc:
+                    logger.warning("Failed to release TongSim resources for {}: {}", self.character_id, exc)
+            else:
+                logger.info("Released character {} and retained shared TongSim connection", self.character_id)
         self.tongsim = None
         self.character_id = None
         self._initialized = False
@@ -617,7 +654,12 @@ class VLMAgent(AgentBase):
             params = first.get("parameters", {})
             output = first.get("output")
             think = first.get("think")
-            return {"action": action, "parameters": params, "output": output, "think": think}
+            parsed = {"action": action, "parameters": params, "output": output, "think": think}
+            # 整理房间模型有时把全景标注写在动作顶层，而不是
+            # parameters 内。解析层若丢弃该字段，策略层就会每轮重新问模型。
+            if isinstance(first.get("scene_annotations"), list):
+                parsed["scene_annotations"] = first["scene_annotations"]
+            return parsed
         except Exception as e:
             logger.error(f"解析动作失败: {e}")
             return {}
@@ -779,12 +821,14 @@ class VLMAgent(AgentBase):
         if not action:
             logger.error("动作为空，无法执行。")
             return self._fail_result(error="empty action")
-        if self.tongsim is None or self.character_id is None:
-            logger.error("TongSim 未初始化。")
-            return self._fail_result(error="TongSim not initialized")
 
         name = (action.get("action") or "").lower()
         params = action.get("parameters") or {}
+
+        local_actions = {"finish_task", "submit_answer", "submit_puzzle_answer", "solve_raven"}
+        if name not in local_actions and (self.tongsim is None or self.character_id is None):
+            logger.error("TongSim 未初始化。")
+            return self._fail_result(error="TongSim not initialized")
 
         handler = {
             "finish_task": self._handle_finish,
@@ -1080,9 +1124,14 @@ class VLMAgent(AgentBase):
         if not npc_asset_name:
             return self._fail_result(error=f"npc not found: {npc_name}")
 
-        # 较新服务端直接按资产名寻路，不再需要先解析出 object_id。
+        # 优先用 NPC 专用寻路 RPC；旧服务端未实现时再按名称查询 object_id。
         mover = getattr(self.tongsim, "move_to_npc", None)
-        if mover is not None:
+        if callable(mover):
+            logger.info(
+                "move_to_npc got npc_name {} mapped to legacy asset_name {}",
+                npc_name,
+                npc_asset_name,
+            )
             result = mover(self.character_id, npc_asset_name)
             if result is not None:
                 return result
