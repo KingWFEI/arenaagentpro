@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import os
 import pkgutil
 from pathlib import Path
 from typing import Callable, Iterable
@@ -100,6 +101,19 @@ def _try_import_agent_modules(agent_name: str) -> None:
         _import_and_register(module)
         if _AGENT_REGISTRY:
             return
+
+
+def _reconnect_delay_seconds() -> float:
+    """每个 subject 结束后重建 Arena 通道之间的退避时间。
+
+    赛题的 agent 是"一个 subject 一个会话"，本题 10 个 subject 就是 10 次重建；
+    原来固定 sleep 5 秒，一共白等 50 秒。默认压到 0.5 秒，可用
+    ARENA_RECONNECT_DELAY_SECONDS 调回。
+    """
+    try:
+        return max(0.0, float(os.getenv("ARENA_RECONNECT_DELAY_SECONDS", "0.5")))
+    except ValueError:
+        return 0.5
 
 
 def _resolve_grpc_target(config: dict) -> str:
@@ -264,7 +278,8 @@ def main() -> None:
         for _ in range(runtimes):
             channel = _create_channel(grpc_target)
             stub = TongTestAgentServiceStub(channel)
-            time.sleep(2)  # 等待连接稳定
+            # 不再固定等待 2 秒“连接稳定”：gRPC 的调用会自己排队到通道就绪，
+            # 每个 subject 都空等一次纯属浪费。
             agent = None
             try:
                 agent = builder.build(args.agent_name, stub=stub, channel=channel)
@@ -283,7 +298,8 @@ def main() -> None:
             finally:
                 logger.info("Closing Arena gRPC channel")
                 channel.close()
-                time.sleep(5)  # 避免短时间内重复创建 Arena 连接
+                # 只保留一个很小的退避防止热重连，默认 0.5 秒（原为 5 秒）。
+                time.sleep(_reconnect_delay_seconds())
     finally:
         if shared_tongsim is not None:
             try:

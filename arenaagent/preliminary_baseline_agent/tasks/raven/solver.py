@@ -221,8 +221,8 @@ def restore_prior_model_votes(previous_attempts: list[dict[str, Any]] | None) ->
     for attempt in reversed(previous_attempts or []):
         if not isinstance(attempt, dict):
             continue
-        for field in ("visual_votes", "text_votes"):
-            values = attempt.get(field, [])
+        for vote_field in ("visual_votes", "text_votes"):
+            values = attempt.get(vote_field, [])
             if not isinstance(values, list):
                 continue
             for value in values:
@@ -361,16 +361,6 @@ class HybridRavenSolver:
                 logger.warning("Raven visual reasoner failed; keep deterministic fallback: {}", exc)
         visual_finished = time.perf_counter()
 
-        preliminary = [
-            combine_question(
-                rule_scores=rule_results[index].scores,
-                rule_confidence=rule_results[index].confidence,
-                legacy_scores=legacy_scores[index],
-                visual_vote=_vote_for_question(visual_votes, index + 1),
-            )
-            for index in range(3)
-        ]
-
         # Rejection feedback is already supplied to the visual reasoner.  Do not
         # automatically make a second, equally expensive image-model call on
         # every retry: on the competition server that caused one subject to run
@@ -422,17 +412,33 @@ class HybridRavenSolver:
             except ValueError:
                 override_threshold = 0.85
             override_threshold = max(0.0, min(override_threshold, 1.0))
+            try:
+                ambiguity_margin = float(os.getenv("RAVEN_LEGACY_AMBIGUITY_MARGIN", "0.12"))
+            except ValueError:
+                ambiguity_margin = 0.12
+            ambiguity_margin = max(0.0, min(ambiguity_margin, 1.0))
             for index in range(3):
-                legacy_answer = int(np.argmax(np.asarray(legacy_scores[index]))) + 1
+                legacy_probabilities = np.asarray(legacy_scores[index])
+                legacy_order = np.argsort(legacy_probabilities)[::-1]
+                legacy_answer = int(legacy_order[0]) + 1
                 if selected[index] == legacy_answer:
                     continue
                 visual_vote = _vote_for_question(visual_votes, index + 1)
                 rule_answer = int(np.argmax(np.asarray(rule_results[index].scores))) + 1
+                legacy_margin = float(
+                    legacy_probabilities[legacy_order[0]] - legacy_probabilities[legacy_order[1]]
+                )
+                legacy_top_three = {int(candidate) + 1 for candidate in legacy_order[:3]}
+                rule_supports_visual = rule_answer == selected[index]
+                ambiguous_legacy_supports_visual = bool(
+                    legacy_margin <= ambiguity_margin and selected[index] in legacy_top_three
+                )
                 visual_can_override = bool(
                     visual_vote is not None
                     and visual_vote.answer == selected[index]
-                    and rule_answer == selected[index]
                     and visual_vote.confidence >= override_threshold
+                    and legacy_margin <= ambiguity_margin
+                    and (rule_supports_visual or ambiguous_legacy_supports_visual)
                 )
                 if not visual_can_override:
                     conservative_overrides.append(
@@ -443,6 +449,7 @@ class HybridRavenSolver:
                             "visual_answer": visual_vote.answer if visual_vote else None,
                             "visual_confidence": visual_vote.confidence if visual_vote else None,
                             "rule_answer": rule_answer,
+                            "legacy_margin": round(legacy_margin, 6),
                         }
                     )
                     selected[index] = legacy_answer

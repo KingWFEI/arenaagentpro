@@ -21,9 +21,10 @@ class RavenStrategy(TaskStrategy):
         self.solve_attempts += 1
         return {
             "action": "solve_raven",
-            "parameters": {},
+            # 第几次作答：赛题端答对才结束这道题，重答时提示模型重新独立求解。
+            "parameters": {"attempt": self.solve_attempts},
             "output": 0,
-            "think": "使用瑞文专用混合求解器，完成候选评分、置信融合与答案编号校验。",
+            "think": "用整张画布做一次视觉推理，直接给出三道题的候选编号。",
         }
 
     def validate_action(self, action: dict[str, Any], context: TaskContext | None) -> dict[str, Any]:

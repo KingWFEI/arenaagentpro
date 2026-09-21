@@ -15,6 +15,7 @@ from typing import Any
 from loguru import logger
 from PIL import Image
 
+from arenaagent.preliminary_baseline_agent.tasks.raven.pure_vision import solve_pure_vision
 from arenaagent.vlm_agent.skills.raven import (
     crop_group_image_to_pil_groups,
     crop_group_image_to_subplots,
@@ -570,8 +571,77 @@ def resolve_raven_image_path(image_temp_path: str) -> str | None:
     return None
 
 
+def _pure_vision_enabled() -> bool:
+    """默认纯视觉：一次 K3 请求、三道题各一张图。
+
+    旧的混合求解器按 train 环境调的（OpenCV/规则/旧先验/融合层），test 下不可靠，
+    设置 RAVEN_PURE_VISION=0 可以切回去做对比。
+    """
+    return os.getenv("RAVEN_PURE_VISION", "1").strip().lower() not in {"0", "false", "no"}
+
+
+def _consensus_raven_answers(votes: list[list[int]]) -> list[int]:
+    """按位置多数票组合多次独立结果；平票时优先最新的复核。"""
+    if not votes:
+        return []
+    combined: list[int] = []
+    for position in range(3):
+        counts: dict[int, int] = {}
+        for vote in votes:
+            if len(vote) == 3 and 1 <= int(vote[position]) <= 8:
+                value = int(vote[position])
+                counts[value] = counts.get(value, 0) + 1
+        if not counts:
+            return []
+        best_count = max(counts.values())
+        tied = {value for value, count in counts.items() if count == best_count}
+        newest = next(vote[position] for vote in reversed(votes) if vote[position] in tied)
+        combined.append(int(newest))
+    return combined
+
+
+def _handle_pure_vision(agent: Any, params: dict[str, Any]) -> dict[str, Any]:
+    resolved_image_path = resolve_raven_image_path(getattr(agent, "_raven_image_temp_path", ""))
+    if not resolved_image_path:
+        logger.warning("raven image path is not exist")
+        return _fail(agent, "raven image path not exist")
+    try:
+        attempt = max(1, int((params or {}).get("attempt", 1)))
+    except (TypeError, ValueError):
+        attempt = 1
+    answers, diagnostics = solve_pure_vision(
+        getattr(agent, "vlm_client", None), resolved_image_path, attempt=attempt
+    )
+    if answers is not None:
+        histories = getattr(agent, "_raven_pure_vision_votes", None)
+        if not isinstance(histories, dict):
+            histories = {}
+            agent._raven_pure_vision_votes = histories
+        history = histories.setdefault(resolved_image_path, [])
+        if attempt <= 1:
+            history.clear()
+        history.append(list(answers))
+        # 前两次保留独立探索；第三次才用逐位多数票收敛。三位整体判错
+        # 不能指出哪一位错，逐位投票能保留 Q2 这类稳定结果。
+        if attempt >= 3 and len(history) >= 3:
+            raw_answers = list(answers)
+            answers = _consensus_raven_answers(history)
+            diagnostics["raw_answers"] = raw_answers
+            diagnostics["vote_history"] = [list(vote) for vote in history]
+            diagnostics["consensus_answers"] = list(answers)
+            logger.info("Raven third-attempt per-position consensus {} from {}", answers, history)
+    agent._raven_last_diagnostics = diagnostics
+    if answers is None:
+        return _fail(agent, "Raven pure vision produced no usable answer")
+    action_space = getattr(agent, "action_space", {}) or {}
+    key = action_space.get("key") or "action"
+    return {key: answers}
+
+
 def handle(agent: Any, params: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
-    """Handle the solve_raven action for agents with prepared Raven task data."""
+    """纯视觉（默认）；RAVEN_PURE_VISION=0 时切回旧的混合求解器。"""
+    if _pure_vision_enabled():
+        return _handle_pure_vision(agent, params)
     image_temp_path = getattr(agent, "_raven_image_temp_path", "")
     resolved_image_path = resolve_raven_image_path(image_temp_path)
     if not resolved_image_path:

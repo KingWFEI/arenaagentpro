@@ -172,7 +172,7 @@ def _direct_answer_sequence(value: Any, expected_questions: int) -> list[int]:
 def parse_direct_model_votes(
     text: str,
     expected_questions: int = 3,
-    confidence: float = 0.90,
+    confidence: float = 0.75,
 ) -> list[ModelVote]:
     """Parse K3's concise whole-canvas answer without accepting numbers from prose."""
     structured = parse_model_votes(text, expected_questions=expected_questions)
@@ -211,15 +211,43 @@ def parse_direct_model_votes(
     if not answers:
         return []
 
-    selected_confidence = _clamp_confidence(confidence, default=0.90)
-    remainder = (1.0 - selected_confidence) / 7.0
+    reported_confidences: list[float] = []
+    for payload in _json_payloads(text or ""):
+        if not isinstance(payload, dict):
+            continue
+        raw_confidences = payload.get("confidences", payload.get("confidence"))
+        if isinstance(raw_confidences, (list, tuple)) and len(raw_confidences) == expected_questions:
+            reported_confidences = [
+                _clamp_confidence(value, default=confidence) for value in raw_confidences
+            ]
+            break
+    if not reported_confidences:
+        confidence_match = re.search(
+            r"(?:置信度|confidences?)\s*[:：=]\s*([0-9.,，、％%\s]+)",
+            text or "",
+            flags=re.IGNORECASE,
+        )
+        if confidence_match:
+            raw_values = re.findall(r"[0-9]+(?:\.[0-9]+)?", confidence_match.group(1))
+            if len(raw_values) >= expected_questions:
+                reported_confidences = [
+                    _clamp_confidence(value, default=confidence)
+                    for value in raw_values[:expected_questions]
+                ]
+    if not reported_confidences:
+        reported_confidences = [_clamp_confidence(confidence, default=0.75)] * expected_questions
+
     return [
         ModelVote(
             question=question,
             answer=answer,
-            confidence=selected_confidence,
+            confidence=reported_confidences[question - 1],
             candidate_confidences={
-                candidate: selected_confidence if candidate == answer else remainder
+                candidate: (
+                    reported_confidences[question - 1]
+                    if candidate == answer
+                    else (1.0 - reported_confidences[question - 1]) / 7.0
+                )
                 for candidate in range(1, 9)
             },
             rule="K3 whole-image direct answer",

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
 import math
 import os
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from google.protobuf import struct_pb2
@@ -22,18 +27,14 @@ from arenaagent.preliminary_baseline_agent.tasks.counting.runtime import run_cou
 from arenaagent.preliminary_baseline_agent.tasks.jigsaw.runner import run_dedicated_jigsaw
 from arenaagent.preliminary_baseline_agent.tasks.npc.runner import run_npc_fast_step
 from arenaagent.preliminary_baseline_agent.tasks.npc.strategy import NpcStrategy
+from arenaagent.preliminary_baseline_agent.tasks.raven.vision_client import (
+    build_raven_vision_client_from_env,
+)
 from arenaagent.preliminary_baseline_agent.tasks.tidyroom.survey import run_scene_survey
 from arenaagent.preliminary_baseline_agent.tasks.tidyroom.vlm_client import (
     build_tidyroom_vision_client_from_env,
 )
-from arenaagent.preliminary_baseline_agent.tasks.raven.vision_client import (
-    build_raven_vision_client_from_env,
-)
-from arenaagent.preliminary_baseline_agent.tasks.raven.local_dataset import (
-    collect_labeled_raven_subject,
-)
 from arenaagent.utils.configclass import configclass
-from arenaagent.vlm_agent.raven_skill import record_confirmed_raven_experience
 from arenaagent.vlm_agent.vlm_agent import VLMAgent, VLMAgentCfg
 
 
@@ -62,6 +63,11 @@ class PreliminaryBaselineAgent(VLMAgent):
 
     _TIDYROOM_MAX_LOCAL_STEPS = 64
     _NPC_MAX_LOCAL_STEPS = 8
+    # test 环境中一次合法提交就会结算，answer_right=True 只表示请求被接受，并非泄露
+    # 正确性。最多三次仅用于“尚未提交时”的网络/解析失败恢复；首个有效答案只提交一次。
+    _RAVEN_MAX_INFERENCE_ATTEMPTS = 3
+    _RAVEN_MIN_CALL_INTERVAL_SECONDS = 0.0
+    _RAVEN_SUBJECT_SETTLE_WINDOW_SECONDS = 12.0
     _TIDYROOM_POST_TURN_SETTLE_SECONDS = 0.75
     _TIDYROOM_POST_TURN_MAX_ATTEMPTS = 10
     # 不再用固定数量门槛：鞋柜等视角本来就只看得见几件物品。未就绪帧由
@@ -100,6 +106,7 @@ class PreliminaryBaselineAgent(VLMAgent):
         self._tidyroom_survey_frames: list[str] = []
         self.raven_text_client = None
         self._raven_text_client_initialized = False
+        self._raven_vlm_client_initialized = False
         self.npc_text_client = None
         self._npc_text_client_initialized = False
         self.counting_review_client = None
@@ -108,6 +115,7 @@ class PreliminaryBaselineAgent(VLMAgent):
         self._tidyroom_vlm_client_initialized = False
         self._jigsaw_attempt_subject_key: tuple[str, str] | None = None
         self._prefetched_subject: dict[str, Any] | None = None
+        self._prefetched_subject_at: datetime | None = None
         self._skip_tongsim_character_init = False
 
     def init(self, opt: dict[str, Any]) -> None:
@@ -119,6 +127,7 @@ class PreliminaryBaselineAgent(VLMAgent):
             prefetched = {}
         if isinstance(prefetched, dict) and prefetched:
             self._prefetched_subject = prefetched
+            self._prefetched_subject_at = datetime.now()
             self._skip_tongsim_character_init = normalize_task_type(prefetched) == "raven"
         if self._skip_tongsim_character_init:
             # Bound the correction path as well as the fast path. The Moonshot
@@ -134,6 +143,7 @@ class PreliminaryBaselineAgent(VLMAgent):
             # Raven uses a task-specific K3 whole-image client with thinking
             # disabled so one three-question request stays inside the score budget.
             self.vlm_client = build_raven_vision_client_from_env() or self.vlm_client
+            self._raven_vlm_client_initialized = True
         raw_location = opt.get("spawn_loc")
         try:
             location = json.loads(raw_location) if isinstance(raw_location, str) else raw_location
@@ -171,7 +181,11 @@ class PreliminaryBaselineAgent(VLMAgent):
             run_counting_subject(self, subject)
             return
         if task_type == "raven":
-            self._run_raven_subject_safely(subject)
+            # 预取发生在"agent 一连上"的时刻，而赛题端要等 wait_after_first_agent_secs
+            # 才通知开始答题；这中间的窗口里 get_subject 可能还是**上一题**的题图，
+            # 于是我们解旧图、赛题端按新题判分（实测 slot 2 取到 slot 1 的图，三答全错）。
+            # 这里的调用点已经在 is_ready_for_agent 之后，重新取一次才保证是本题。
+            self._run_raven_subject_safely(self._get_subject_from_task())
             return
         if task_type == "npc":
             self._run_npc_subject_fast(subject)
@@ -283,57 +297,162 @@ class PreliminaryBaselineAgent(VLMAgent):
         else:
             logger.error("NPC fast loop ended without an answer accepted by Arena")
 
-    def _run_raven_subject_safely(self, first_subject: dict[str, Any]) -> None:
-        """Submit exactly once, while discarding work for a subject that already changed.
+    _RAVEN_PAIR_RECORD = Path("logs/raven_subject_pairs.jsonl")
+    _RAVEN_IMAGE_DIR = Path("logs/raven_subject_images")
 
-        A remote vision call cannot be cancelled once it is in flight.  The
-        server may force-evaluate the old subject meanwhile; submitting its
-        result afterwards would otherwise apply that answer to the new image.
+    def _record_raven_pair(self, **payload: Any) -> None:
+        """把 (subject 序号 / 题图 / 作答) 追加到 jsonl。
 
-        The black-box Raven task accepts only one final answer.  Train mode may
-        leave a wrong subject marked RUNNING, but that must not be interpreted
-        as permission to launch a second K3/DeepSeek correction round.
+        为什么必须落盘：arena 的答案键只在服务端（`arena_offline/logs/arena_*.log` 里
+        每个 subject 结算时打印一次），本地题图又会随临时目录被清理。09-19 那轮答对过
+        528/687/254/861/272，图全丢了，现在没法把它们当验证样本；不落盘就会重演。
+
+        没连上 arena 时直接跳过：单测会直接调 `_run_raven_subject_safely` 造数据，
+        不设门就会把 mock 的 subject 序号和答案写进真实 manifest（实测过一次）。
         """
-        subject: dict[str, Any] = first_subject
-        while not self._current_subject_finished():
-            subject_index_before = self._raven_current_subject_index()
-            logger.info(
-                "Agent[{}] is running Raven subject index {}: {}",
-                self.agent_id,
-                subject_index_before,
-                {key: value for key, value in subject.items() if key != "task_data"},
+        if not getattr(self, "connected", False):
+            return
+        payload["ts"] = datetime.now().isoformat(timespec="seconds")
+        payload["agent_id"] = self.agent_id
+        try:
+            self._RAVEN_PAIR_RECORD.parent.mkdir(parents=True, exist_ok=True)
+            with self._RAVEN_PAIR_RECORD.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except OSError as exc:  # noqa: BLE001 - 记录失败不能影响作答
+            logger.warning("Could not append raven pair record: {}", exc)
+
+    def _record_raven_subject_image(self, subject_index: int, subject: dict[str, Any]) -> None:
+        """按内容 hash 永久保存本题题图（同名文件即同一张图，可反复覆盖）。"""
+        raw_text = str(subject.get("task_data") or "")
+        if not raw_text:
+            return
+        try:
+            raw = base64.b64decode(raw_text, validate=False)
+        except (ValueError, binascii.Error) as exc:
+            logger.warning("Could not decode raven subject image: {}", exc)
+            return
+        digest = hashlib.sha256(raw).hexdigest()
+        target = self._RAVEN_IMAGE_DIR / f"{digest[:12]}.png"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                target.write_bytes(raw)
+        except OSError as exc:  # noqa: BLE001
+            logger.warning("Could not save raven subject image: {}", exc)
+        self._record_raven_pair(
+            event="subject_image",
+            subject_index=subject_index,
+            sha256=digest,
+            path=str(target),
+            # 预取时刻：用来验证"取到的是不是上一题的图"（见 _run_subject 里的说明）
+            prefetched_at=(
+                self._prefetched_subject_at.isoformat(sep=" ", timespec="seconds")
+                if self._prefetched_subject_at
+                else None
+            ),
+        )
+
+    def _run_raven_subject_safely(self, first_subject: dict[str, Any]) -> None:
+        """瑞文纯视觉：提交前完成集成推理，首个有效答案只提交一次。
+
+        纯视觉方案下没有本地候选排序可以回退，服务端判错时也不再用对错反馈
+        去试下一个答案——那既把本地判分当 oracle，又要在限时里反复往返。
+        """
+        subject_index = self._raven_current_subject_index()
+        logger.info(
+            "Agent[{}] is solving Raven subject index {}: {}",
+            self.agent_id,
+            subject_index,
+            {key: value for key, value in first_subject.items() if key != "task_data"},
+        )
+        self._record_raven_subject_image(subject_index, first_subject)
+        self.action_space = parse_struct_to_data(
+            self._call_struct(
+                "get_action_space",
+                {"agent_id": self.agent_id},
+                struct_pb2.Struct.FromString,
             )
-            self.action_space = parse_struct_to_data(
-                self._call_struct(
-                    "get_action_space",
-                    {"agent_id": self.agent_id},
-                    struct_pb2.Struct.FromString,
-                )
-            )
-            task_response = self._get_response_from_task()
-            action = self.run_step(subject, task_response)
-            subject_index_after = self._raven_current_subject_index()
-            if subject_index_after != subject_index_before:
+        )
+        task_response = self._get_response_from_task()
+        last_call_started = 0.0
+        for attempt in range(1, self._RAVEN_MAX_INFERENCE_ATTEMPTS + 1):
+            if attempt > 1:
+                # 这里只会在上一轮没有产生可提交答案时触发。
+                gap = self._RAVEN_MIN_CALL_INTERVAL_SECONDS - (time.monotonic() - last_call_started)
+                if gap > 0:
+                    time.sleep(gap)
+            if self._raven_current_subject_index() != subject_index:
+                # 视觉请求在飞行中时服务端可能已经换题；把旧答案提交到新图上等于
+                # 答错一整题，直接放弃这一轮。
                 logger.warning(
-                    "Discarding stale Raven answer because subject changed {} -> {} during reasoning",
-                    subject_index_before,
-                    subject_index_after,
+                    "Discarding stale Raven answer because subject moved on during reasoning (index {})",
+                    subject_index,
                 )
                 self.subject_finished = False
-                subject = self._get_subject_from_task()
+                return
+            last_call_started = time.monotonic()
+            action = self.run_step(first_subject, task_response)
+            if not isinstance(action, dict) or action.get("result") == "failed":
+                # 视觉请求失败（限流、超时、解析不出）时不要提交：否则会把一次
+                # 空作答记在这道题上，赛题端照样判错。
+                logger.warning(
+                    "Raven inference attempt {}/{} produced no usable answer: {}",
+                    attempt,
+                    self._RAVEN_MAX_INFERENCE_ATTEMPTS,
+                    action,
+                )
                 continue
             apply_response = self._apply_action(action)
             logger.info(
-                "Raven one-shot answer submitted for subject index {}; requesting evaluation without retry "
-                "(response={})",
-                subject_index_before,
+                "Raven one-shot answer submitted after inference attempt {}/{} for subject index {} (response={})",
+                attempt,
+                self._RAVEN_MAX_INFERENCE_ATTEMPTS,
+                subject_index,
                 apply_response,
             )
-            break
+            self._record_raven_pair(
+                event="submit",
+                subject_index=subject_index,
+                attempt=attempt,
+                answer=action.get("answer"),
+                answer_right=apply_response.get("answer_right"),
+            )
+            self._evaluate_subject()
+            if self._wait_for_raven_subject_to_settle():
+                logger.info(
+                    "Raven subject index {} settled after its one allowed submission", subject_index
+                )
+                # 题目已被赛题端判定完成，之后不必再空等 session 终态（见 AgentBase.run）。
+                self.subject_settled = True
+                return
+            logger.info(
+                "Raven subject index {} is not terminal yet; test submissions are one-shot, so no second answer will be sent",
+                subject_index,
+            )
+            # AgentBase.run keeps the connection alive until the arena reaches a terminal state.
+            return
+        logger.error(
+            "Raven subject index {} produced no usable answer after {} local inference attempts",
+            subject_index,
+            self._RAVEN_MAX_INFERENCE_ATTEMPTS,
+        )
 
-        evaluation = self._evaluate_subject()
-        collect_labeled_raven_subject(self, evaluation)
-        record_confirmed_raven_experience(self, evaluation)
+    def _wait_for_raven_subject_to_settle(self) -> bool:
+        """等赛题端把当前这道题判结束。
+
+        test 环境中提交后通常会结算；这个短轮询只用于识别已完成状态。即使暂未看到
+        终态也绝不据此二次提交，外层会继续保持连接等待 arena 评测。
+        """
+        deadline = time.monotonic() + self._RAVEN_SUBJECT_SETTLE_WINDOW_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                if self._current_subject_finished():
+                    return True
+            except Exception as exc:  # noqa: BLE001 - 探测失败按未结束处理
+                logger.debug("Raven settle probe failed: {}", exc)
+                return False
+            time.sleep(self.session_poll_seconds)
+        return False
 
     def _raven_current_subject_index(self) -> int:
         """Read the current subject index through the RPC exposed by AgentBase."""
@@ -346,6 +465,19 @@ class PreliminaryBaselineAgent(VLMAgent):
 
     def _ensure_task_strategy(self, subject: Any) -> TaskStrategy:
         task_type = normalize_task_type(subject)
+        if task_type == "raven" and not self._raven_vlm_client_initialized:
+            # The first subject can be unavailable during init when the agent
+            # connects before the Arena flow becomes ready.  Build the bounded
+            # non-thinking K3 client lazily as soon as Raven is actually known;
+            # otherwise the generic startup client may have no request timeout.
+            raven_client = build_raven_vision_client_from_env()
+            if raven_client is not None:
+                self.vlm_client = raven_client
+            else:
+                logger.warning(
+                    "Raven bounded vision client unavailable; falling back to the primary client"
+                )
+            self._raven_vlm_client_initialized = True
         if task_type == "counting" and not self._counting_review_client_initialized:
             self.counting_review_client = build_counting_review_client_from_env()
             self._counting_review_client_initialized = True

@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
+import math
+import os
+import re
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -225,7 +231,12 @@ class RavenVerifierTests(unittest.TestCase):
         for response in ("答案：5,8,2", "582", "[5, 8, 2]"):
             votes = parse_direct_model_votes(response)
             self.assertEqual([vote.answer for vote in votes], [5, 8, 2])
-            self.assertTrue(all(vote.confidence == 0.9 for vote in votes))
+            self.assertTrue(all(vote.confidence == 0.75 for vote in votes))
+
+    def test_whole_image_direct_answers_parse_per_question_confidences(self) -> None:
+        votes = parse_direct_model_votes("答案：2,7,6；置信度：0.85,0.90,0.80")
+        self.assertEqual([vote.answer for vote in votes], [2, 7, 6])
+        self.assertEqual([vote.confidence for vote in votes], [0.85, 0.9, 0.8])
 
     def test_whole_image_direct_answers_do_not_guess_from_explanatory_numbers(self) -> None:
         self.assertEqual(parse_direct_model_votes("第1题可能是5，第2题可能是8。"), [])
@@ -306,7 +317,112 @@ class RavenRoutingTests(unittest.TestCase):
         self.assertTrue(agent._should_use_lightweight_perception({"task_type": "tidyroom"}))
 
 
+class _FakeVisionClient:
+    """只回文本的假视觉客户端，用来驱动纯视觉求解路径。
+
+    `answers` 给定时按**请求里写的题号**回 `{"answers": [n]}`：三题并行发出，
+    调用次序没有保证，只看调用次数会让测试随机翻车。
+    """
+
+    def __init__(self, text: str, answers: list[int] | None = None) -> None:
+        self.text = text
+        self.answers = list(answers) if answers else None
+        self.calls: list[list[dict]] = []
+        self._lock = threading.Lock()
+
+    def invoke(self, messages, max_retries: int = 1):
+        del max_retries
+        with self._lock:
+            self.calls.append(messages)
+        question = self._question_of(messages)
+        if self.answers and question is not None and 1 <= question <= len(self.answers):
+            return SimpleNamespace(text=json.dumps({"answers": [self.answers[question - 1]]}))
+        return SimpleNamespace(text=self.text)
+
+    @staticmethod
+    def _question_of(messages) -> int | None:
+        for part in messages[0].get("content", []) if messages else []:
+            if part.get("type") != "text":
+                continue
+            match = re.search(r"第\s*(\d)\s*题", part.get("text", ""))
+            if match:
+                return int(match.group(1))
+        return None
+
+
+class _PureVisionAgent:
+    """handle() 需要的最小 agent 形状。"""
+
+    subject_finished = False
+    action_space = {"key": "answer"}
+
+    def __init__(self, image_path: str) -> None:
+        self._raven_image_temp_path = image_path
+
+
+def _synthetic_raven_panel() -> Image.Image:
+    """画一块提取器量得到的题图：8 个矩阵格 + 8 个候选格，每格一个深色五边形。"""
+    panel = Image.new("RGB", (792, 1200), "white")
+    draw = ImageDraw.Draw(panel)
+
+    def cell(x: int, y: int, size: int, radius_ratio: float) -> None:
+        draw.rectangle([x, y, x + size, y + size], outline="black", width=3)
+        cx, cy, radius = x + size / 2, y + size / 2, size * radius_ratio
+        draw.polygon(
+            [
+                (
+                    cx + radius * math.cos(math.radians(-90 + 72 * step)),
+                    cy + radius * math.sin(math.radians(-90 + 72 * step)),
+                )
+                for step in range(5)
+            ],
+            fill="black",
+        )
+
+    for row, y in enumerate((107, 319, 531)):
+        for col, x in enumerate((52, 296, 540)):
+            if (row, col) == (2, 2):
+                continue  # 问号格
+            cell(x, y, 196, 0.3 + 0.03 * row)
+    for y in (811, 1010):
+        for x in (53, 228, 403, 578):
+            cell(x, y, 156, 0.28)
+    return panel
+
+
 class RavenRuntimeSafetyTests(unittest.TestCase):
+    def test_raven_third_attempt_uses_per_position_consensus(self) -> None:
+        agent = _PureVisionAgent("same-subject.png")
+        agent.action_space = {"key": "answer"}
+        agent.vlm_client = object()
+        with patch(
+            "arenaagent.vlm_agent.raven_skill.resolve_raven_image_path",
+            return_value="same-subject.png",
+        ), patch(
+            "arenaagent.vlm_agent.raven_skill.solve_pure_vision",
+            side_effect=[
+                ([5, 8, 6], {}),
+                ([5, 8, 2], {}),
+                ([8, 8, 2], {}),
+            ],
+        ):
+            first = handle(agent, {"attempt": 1}, {})
+            second = handle(agent, {"attempt": 2}, {})
+            third = handle(agent, {"attempt": 3}, {})
+
+        self.assertEqual(first, {"answer": [5, 8, 6]})
+        self.assertEqual(second, {"answer": [5, 8, 2]})
+        self.assertEqual(third, {"answer": [5, 8, 2]})
+        self.assertEqual(agent._raven_last_diagnostics["raw_answers"], [8, 8, 2])
+
+    def test_raven_consensus_tie_prefers_latest_review(self) -> None:
+        from arenaagent.vlm_agent.raven_skill import _consensus_raven_answers
+
+        self.assertEqual(
+            _consensus_raven_answers([[1, 2, 3], [4, 5, 6]]),
+            [4, 5, 6],
+        )
+
     def test_raven_vision_client_uses_non_thinking_k3_with_short_timeout(self) -> None:
         sentinel = object()
         environment = {
@@ -332,7 +448,8 @@ class RavenRuntimeSafetyTests(unittest.TestCase):
             cfg.chat_completion_kwargs,
             {
                 "extra_body": {"thinking": {"type": "disabled"}},
-                "max_tokens": 256,
+                # 单题作答要先给一句规律说明再给编号，256 会截断。
+                "max_tokens": 512,
             },
         )
 
@@ -347,6 +464,48 @@ class RavenRuntimeSafetyTests(unittest.TestCase):
 
         self.assertEqual(result, expected)
         solve.assert_called_once()
+
+    def test_raven_submits_once_when_the_subject_settles(self) -> None:
+        agent = PreliminaryBaselineAgent(stub=None, channel=None)
+        agent.action_space = {"key": "answer"}
+        subject = {"task_type": "raven", "task_data": "image"}
+        with patch.object(agent, "_raven_current_subject_index", side_effect=[4, 4]), patch.object(
+            agent, "_call_struct", return_value=object()
+        ), patch(
+            "arenaagent.preliminary_baseline_agent.preliminary_baseline_agent.parse_struct_to_data",
+            return_value={"key": "answer"},
+        ), patch.object(agent, "_get_response_from_task", return_value={}), patch.object(
+            agent, "run_step", return_value={"answer": [6, 8, 7]}
+        ) as run_step, patch.object(agent, "_apply_action", return_value={}) as apply_action, patch.object(
+            agent, "_evaluate_subject", return_value={}
+        ) as evaluate, patch.object(agent, "_current_subject_finished", return_value=True):
+            agent._run_raven_subject_safely(subject)
+
+        run_step.assert_called_once()
+        apply_action.assert_called_once_with({"answer": [6, 8, 7]})
+        evaluate.assert_called_once_with()
+
+    def test_raven_test_submission_is_one_shot(self) -> None:
+        """test 会屏蔽对错并结算；首个有效答案提交后不得再发第二个答案。"""
+        agent = PreliminaryBaselineAgent(stub=None, channel=None)
+        agent.action_space = {"key": "answer"}
+        subject = {"task_type": "raven", "task_data": "image"}
+        with patch.object(agent, "_raven_current_subject_index", side_effect=[4, 4, 4, 4]), patch.object(
+            agent, "_call_struct", return_value=object()
+        ), patch(
+            "arenaagent.preliminary_baseline_agent.preliminary_baseline_agent.parse_struct_to_data",
+            return_value={"key": "answer"},
+        ), patch.object(agent, "_get_response_from_task", return_value={}), patch.object(
+            agent, "run_step", return_value={"answer": [7, 8, 7]}
+        ) as run_step, patch.object(
+            agent, "_apply_action", return_value={"answer_right": False}
+        ) as apply_action, patch.object(agent, "_evaluate_subject", return_value={}), patch.object(
+            agent, "_RAVEN_SUBJECT_SETTLE_WINDOW_SECONDS", 0.0
+        ), patch("arenaagent.preliminary_baseline_agent.preliminary_baseline_agent.time.sleep"):
+            agent._run_raven_subject_safely(subject)
+
+        self.assertEqual(run_step.call_count, 1)
+        apply_action.assert_called_once_with({"answer": [7, 8, 7]})
 
     def test_raven_init_prefetch_skips_tongsim_character_spawn(self) -> None:
         agent = PreliminaryBaselineAgent(stub=None, channel=None)
@@ -368,6 +527,24 @@ class RavenRuntimeSafetyTests(unittest.TestCase):
         self.assertIsNone(agent.character_id)
         self.assertIsNone(agent.semantic_mapper)
         self.assertEqual(agent._prefetched_subject, raven_subject)
+
+    def test_raven_late_subject_builds_bounded_dedicated_client(self) -> None:
+        agent = PreliminaryBaselineAgent(stub=None, channel=None)
+        primary_client = object()
+        dedicated_client = object()
+        agent.vlm_client = primary_client
+
+        with patch(
+            "arenaagent.preliminary_baseline_agent.preliminary_baseline_agent."
+            "build_raven_vision_client_from_env",
+            return_value=dedicated_client,
+        ) as build:
+            agent._ensure_task_strategy({"task_type": "raven", "subject": "matrix"})
+            agent._ensure_task_strategy({"task_type": "raven", "subject": "matrix"})
+
+        self.assertIs(agent.vlm_client, dedicated_client)
+        self.assertTrue(agent._raven_vlm_client_initialized)
+        build.assert_called_once_with()
 
     def test_non_raven_init_still_spawns_tongsim_character(self) -> None:
         agent = PreliminaryBaselineAgent(stub=None, channel=None)
@@ -561,7 +738,7 @@ class RavenRuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(result.selected_answers, [5, 8, 2])
         self.assertTrue(result.diagnostics["visual_fallback_to_legacy"])
 
-    def test_initial_visual_override_requires_rule_agreement_and_high_confidence(self) -> None:
+    def test_initial_visual_override_requires_high_self_reported_confidence(self) -> None:
         groups = [[Image.new("L", (32, 32), "white") for _ in range(16)] for _ in range(3)]
         votes = [
             ModelVote(question=1, answer=8, confidence=0.82),
@@ -581,10 +758,97 @@ class RavenRuntimeSafetyTests(unittest.TestCase):
             ]
             result = HybridRavenSolver(vlm_client=object()).solve(
                 groups,
-                legacy_ranked=[[5, 5, 5]],
+                legacy_ranked=[[5, 5, 5], [5, 7, 7], [5, 6, 6]],
             )
         self.assertEqual(result.selected_answers, [5, 6, 6])
         self.assertEqual(result.diagnostics["conservative_legacy_restores"][0]["question"], 1)
+
+    def test_subject_seven_confidence_gate_repairs_276_to_272(self) -> None:
+        groups = [[Image.new("L", (32, 32), "white") for _ in range(16)] for _ in range(3)]
+        votes = [
+            ModelVote(question=1, answer=2, confidence=0.85),
+            ModelVote(question=2, answer=7, confidence=0.90),
+            ModelVote(question=3, answer=6, confidence=0.80),
+        ]
+        with patch(
+            "arenaagent.preliminary_baseline_agent.tasks.raven.solver.ask_visual_reasoner",
+            return_value=(votes, "答案：2,7,6；置信度：0.85,0.90,0.80"),
+        ), patch(
+            "arenaagent.preliminary_baseline_agent.tasks.raven.solver.induce_rules"
+        ) as induce:
+            induce.side_effect = [
+                RuleInductionResult([0, 0, 0, 0, 0, 1, 0, 0], 0.8, []),
+                RuleInductionResult([0, 1, 0, 0, 0, 0, 0, 0], 0.8, []),
+                RuleInductionResult([0, 0, 0, 0, 0, 1, 0, 0], 0.8, []),
+            ]
+            result = HybridRavenSolver(vlm_client=object()).solve(
+                groups,
+                legacy_ranked=[[7, 7, 2], [5, 7, 2], [2, 7, 2]],
+            )
+        self.assertEqual(result.selected_answers, [2, 7, 2])
+        self.assertEqual(
+            [entry["question"] for entry in result.diagnostics["conservative_legacy_restores"]],
+            [3],
+        )
+
+    def test_high_visual_confidence_cannot_override_strong_unsupported_legacy(self) -> None:
+        groups = [[Image.new("L", (32, 32), "white") for _ in range(16)] for _ in range(3)]
+        votes = [
+            ModelVote(question=1, answer=4, confidence=0.95),
+            ModelVote(question=2, answer=8, confidence=0.90),
+            ModelVote(question=3, answer=1, confidence=0.95),
+        ]
+        with patch(
+            "arenaagent.preliminary_baseline_agent.tasks.raven.solver.ask_visual_reasoner",
+            return_value=(votes, "答案：4,8,1；置信度：0.95,0.90,0.95"),
+        ), patch(
+            "arenaagent.preliminary_baseline_agent.tasks.raven.solver.induce_rules"
+        ) as induce:
+            induce.side_effect = [
+                RuleInductionResult([0, 0, 0, 0, 0, 0, 0, 1], 0.8, []),
+                RuleInductionResult([0, 0, 0, 0, 0, 0, 1, 0], 0.8, []),
+                RuleInductionResult([0, 1, 0, 0, 0, 0, 0, 0], 0.8, []),
+            ]
+            result = HybridRavenSolver(vlm_client=object()).solve(
+                groups,
+                legacy_ranked=[[5, 8, 2], [7, 8, 2], [3, 8, 2]],
+            )
+        self.assertEqual(result.selected_answers, [5, 8, 2])
+
+    def test_subject_four_strong_legacy_blocks_correlated_visual_rule_error(self) -> None:
+        groups = [[Image.new("L", (32, 32), "white") for _ in range(16)] for _ in range(3)]
+        votes = [
+            ModelVote(question=1, answer=7, confidence=0.95),
+            ModelVote(question=2, answer=4, confidence=0.80),
+            ModelVote(question=3, answer=6, confidence=0.75),
+        ]
+        with patch(
+            "arenaagent.preliminary_baseline_agent.tasks.raven.solver.ask_visual_reasoner",
+            return_value=(votes, "答案：7,4,6；置信度：0.95,0.80,0.75"),
+        ), patch(
+            "arenaagent.preliminary_baseline_agent.tasks.raven.solver.induce_rules"
+        ) as induce:
+            induce.side_effect = [
+                RuleInductionResult([0, 0, 0, 0, 0, 0, 1, 0], 0.9, []),
+                RuleInductionResult([0, 0, 0, 0, 0, 0, 1, 0], 0.8, []),
+                RuleInductionResult([0, 0, 0, 0, 0, 0, 1, 0], 0.8, []),
+            ]
+            result = HybridRavenSolver(vlm_client=object()).solve(
+                groups,
+                legacy_ranked=[
+                    [6, 8, 7],
+                    [6, 8, 1],
+                    [6, 8, 6],
+                    [8, 8, 7],
+                    [6, 8, 3],
+                    [3, 8, 7],
+                    [6, 8, 4],
+                    [6, 8, 5],
+                    [6, 8, 8],
+                    [7, 8, 7],
+                ],
+            )
+        self.assertEqual(result.selected_answers, [6, 8, 7])
 
     def test_raven_subject_index_uses_available_rpc(self) -> None:
         agent = PreliminaryBaselineAgent(stub=None, channel=None)
@@ -602,89 +866,185 @@ class RavenRuntimeSafetyTests(unittest.TestCase):
         self.assertNotIn(payload, str(summary))
         self.assertIn("image/base64", summary["task_data"])
 
-    def test_raven_uses_hybrid_reasoning_on_first_attempt_without_faking_completion(self) -> None:
-        class FakeAgent:
-            subject_finished = False
-            action_space = {"key": "answer"}
-            _raven_image_temp_path = "ignored"
+    def test_raven_pure_vision_submits_the_vision_answer(self) -> None:
+        """纯视觉：三道题各问一次，拼成最终提交的三位答案。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            canvas = Path(tmp) / "canvas.png"
+            Image.new("RGB", (2376, 1200), "white").save(canvas)
+            agent = _PureVisionAgent(str(canvas))
+            client = _FakeVisionClient('{"answers": [3]}', answers=[3, 2, 8])
+            agent.vlm_client = client
 
-            @staticmethod
-            def _get_param(params, name, default=None):
-                return params.get(name, default)
+            with patch.dict(
+                os.environ,
+                {"RAVEN_PURE_VISION": "1", "RAVEN_VISION_PASSES": "1"},
+            ):
+                result = handle(agent, {}, {})
 
-        agent = FakeAgent()
-        fake_groups = [[Image.new("L", (32, 32), "white") for _ in range(16)] for _ in range(3)]
-        with patch("arenaagent.vlm_agent.raven_skill.resolve_raven_image_path", return_value="image.png"), patch(
-            "arenaagent.vlm_agent.raven_skill.normalize_raven_image_list", return_value=fake_groups
-        ), patch(
-            "arenaagent.vlm_agent.raven_skill.get_raven_legacy_candidates",
-            return_value=[[2, 2, 6], [2, 2, 5]],
-        ), patch(
-            "arenaagent.vlm_agent.raven_skill.get_raven_ranked_candidates",
-            return_value=[[3, 2, 8], [2, 2, 6]],
-        ) as hybrid:
-            first = handle(agent, {"structure": []}, {})
-            second = handle(agent, {"structure": []}, {})
-        self.assertEqual(first, {"answer": [3, 2, 8]})
-        self.assertEqual(second.get("result"), "failed")
-        self.assertEqual(hybrid.call_count, 2)
-        self.assertEqual(hybrid.call_args_list[0].kwargs["rejected_answers"], [])
-        self.assertEqual(hybrid.call_args_list[1].kwargs["rejected_answers"], [[3, 2, 8]])
-        self.assertFalse(agent.subject_finished)
+        self.assertEqual(result, {"answer": [3, 2, 8]})
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(agent._raven_last_diagnostics["canvas_size"], (2376, 1200))
 
-    def test_rejected_reasoned_answer_triggers_fresh_revision_not_next_enumeration(self) -> None:
-        class FakeAgent:
-            subject_finished = False
-            action_space = {"key": "answer"}
-            _raven_image_temp_path = "ignored"
+    def test_raven_pre_submit_ensemble_votes_per_position(self) -> None:
+        """test 只能提交一次：三路快答必须在提交前逐位收敛。"""
+        from arenaagent.preliminary_baseline_agent.tasks.raven.pure_vision import solve_pure_vision
 
-            @staticmethod
-            def _get_param(params, name, default=None):
-                return params.get(name, default)
+        runs = [
+            ([5, 8, 6], {"per_question": []}),
+            ([5, 8, 2], {"per_question": []}),
+            ([8, 8, 2], {"per_question": []}),
+        ]
+        with patch.dict(os.environ, {"RAVEN_VISION_PASSES": "3"}), patch(
+            "arenaagent.preliminary_baseline_agent.tasks.raven.pure_vision._solve_pure_vision_once",
+            side_effect=runs,
+        ) as solve_once:
+            answers, diagnostics = solve_pure_vision(object(), "unused.png")
 
-        agent = FakeAgent()
-        fake_groups = [[Image.new("L", (32, 32), "white") for _ in range(16)] for _ in range(3)]
-        with patch("arenaagent.vlm_agent.raven_skill.resolve_raven_image_path", return_value="image.png"), patch(
-            "arenaagent.vlm_agent.raven_skill.normalize_raven_image_list", return_value=fake_groups
-        ), patch(
-            "arenaagent.vlm_agent.raven_skill.get_raven_legacy_candidates", return_value=[[3, 5, 5]]
-        ), patch(
-            "arenaagent.vlm_agent.raven_skill.get_raven_ranked_candidates",
-            side_effect=[[[3, 5, 5]], [[3, 1, 7]], [[3, 6, 6]]],
-        ) as reasoner:
-            first = handle(agent, {}, {})
-            second = handle(agent, {}, {})
-            third = handle(agent, {}, {})
-        self.assertEqual(first, {"answer": [3, 5, 5]})
-        self.assertEqual(second, {"answer": [3, 1, 7]})
-        self.assertEqual(third, {"answer": [3, 6, 6]})
-        self.assertEqual(reasoner.call_count, 3)
-        self.assertIn([3, 1, 7], reasoner.call_args.kwargs["rejected_answers"])
+        self.assertEqual(answers, [5, 8, 2])
+        self.assertEqual(diagnostics["vote_history"], [[5, 8, 6], [5, 8, 2], [8, 8, 2]])
+        self.assertEqual(solve_once.call_count, 3)
 
-    def test_runtime_refuses_second_ranked_combination_when_top_is_rejected(self) -> None:
-        class FakeAgent:
-            subject_finished = False
-            action_space = {"key": "answer"}
-            _raven_image_temp_path = "ignored"
+    def test_raven_pure_vision_asks_one_question_per_request(self) -> None:
+        """整张画布让三道题互相抢注意力；改成每题一次请求，每次带两块图（矩阵 + 候选）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            canvas = Path(tmp) / "canvas.png"
+            Image.new("RGB", (2376, 1200), "white").save(canvas)
+            agent = _PureVisionAgent(str(canvas))
+            client = _FakeVisionClient('{"answers": [1]}', answers=[1, 2, 3])
+            agent.vlm_client = client
 
-            @staticmethod
-            def _get_param(params, name, default=None):
-                return params.get(name, default)
+            with patch.dict(
+                os.environ,
+                {"RAVEN_PURE_VISION": "1", "RAVEN_VISION_PASSES": "1"},
+            ):
+                handle(agent, {}, {})
 
-        agent = FakeAgent()
-        fake_groups = [[Image.new("L", (32, 32), "white") for _ in range(16)] for _ in range(3)]
-        with patch("arenaagent.vlm_agent.raven_skill.resolve_raven_image_path", return_value="image.png"), patch(
-            "arenaagent.vlm_agent.raven_skill.normalize_raven_image_list", return_value=fake_groups
-        ), patch(
-            "arenaagent.vlm_agent.raven_skill.get_raven_legacy_candidates", return_value=[[3, 5, 5]]
-        ), patch(
-            "arenaagent.vlm_agent.raven_skill.get_raven_ranked_candidates",
-            side_effect=[[[3, 5, 5]], [[3, 5, 5], [3, 6, 6]]],
-        ):
-            first = handle(agent, {}, {})
-            second = handle(agent, {}, {})
-        self.assertEqual(first, {"answer": [3, 5, 5]})
-        self.assertEqual(second.get("result"), "failed")
+        self.assertEqual(len(client.calls), 3)
+        for call in client.calls:
+            content = call[0]["content"]
+            self.assertEqual(len(content), 3)  # 一段文字 + 矩阵图 + 候选图
+            sizes = []
+            for item in content[1:]:
+                sent_url = item["image_url"]["url"]
+                with Image.open(io.BytesIO(base64.b64decode(sent_url.split(",", 1)[1]))) as sent:
+                    sizes.append(sent.size)
+            self.assertTrue(all(size[0] < 2376 // 2 for size in sizes))
+            # 矩阵在上、候选在下：切成两张后各自都比整块题图矮
+            self.assertLess(sizes[0][1], 1200)
+            self.assertLess(sizes[1][1], 1200)
+        per_question = agent._raven_last_diagnostics["per_question"]
+        self.assertEqual([item["question"] for item in per_question], [1, 2, 3])
+        for item in per_question:
+            self.assertEqual(len(item["matrix_size"]), 2)
+            self.assertEqual(len(item["option_size"]), 2)
+
+    def test_raven_pure_vision_downscales_panels_only_when_asked(self) -> None:
+        """降采样是可选开关：默认发整块题图，设了 RAVEN_IMAGE_MAX_SIDE 才缩。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            canvas = Path(tmp) / "canvas.png"
+            Image.new("RGB", (2376, 1200), "white").save(canvas)
+            agent = _PureVisionAgent(str(canvas))
+            client = _FakeVisionClient('{"answers": [1, 2, 3]}')
+            agent.vlm_client = client
+
+            with patch.dict(
+                os.environ,
+                {
+                    "RAVEN_IMAGE_MAX_SIDE": "600",
+                    "RAVEN_PURE_VISION": "1",
+                    "RAVEN_VISION_PASSES": "1",
+                },
+            ):
+                handle(agent, {}, {})
+
+        for item in client.calls[0][0]["content"][1:]:
+            sent_url = item["image_url"]["url"]
+            with Image.open(io.BytesIO(base64.b64decode(sent_url.split(",", 1)[1]))) as sent:
+                self.assertLessEqual(max(sent.size), 600)
+
+    def test_raven_pure_vision_splits_question_into_matrix_and_options(self) -> None:
+        """矩阵与候选之间那条最宽的纯白横带就是分界；找不到时按固定比例兜底。"""
+        from arenaagent.preliminary_baseline_agent.tasks.raven.pure_vision import split_question
+
+        panel = Image.new("RGB", (300, 400), "white")
+        draw = ImageDraw.Draw(panel)
+        for y in (60, 160):  # 矩阵两行的格线
+            draw.rectangle([20, y, 280, y + 60], outline="black", width=2)
+        for y in (300,):  # 候选行的格线
+            draw.rectangle([20, y, 280, y + 60], outline="black", width=2)
+        matrix, options = split_question(panel)
+        # 切点必须落在矩阵最后一行（y=220）与候选行（y=300）之间的空白带里
+        self.assertGreater(matrix.height, 221)
+        self.assertLess(matrix.height, 300)
+        self.assertEqual(matrix.width, 300)
+        self.assertEqual(matrix.height + options.height, 400)
+
+        blank = Image.new("RGB", (300, 400), "white")
+        matrix_only, options_only = split_question(blank)
+        self.assertEqual(matrix_only.height + options_only.height, 400)
+        self.assertEqual(matrix_only.height, int(400 * 0.62))
+
+    def test_raven_pure_vision_injects_pixel_measurements(self) -> None:
+        """每题请求里必须带上系统量出的形状/填充/面积，模型才比得出候选尺寸。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            canvas = Path(tmp) / "canvas.png"
+            full = Image.new("RGB", (2376, 1200), "white")
+            full.paste(_synthetic_raven_panel(), (0, 0))
+            full.save(canvas)
+            agent = _PureVisionAgent(str(canvas))
+            client = _FakeVisionClient('{"answers": [1]}', answers=[1, 2, 3])
+            agent.vlm_client = client
+
+            with patch.dict(
+                os.environ,
+                {"RAVEN_PURE_VISION": "1", "RAVEN_VISION_PASSES": "1"},
+            ):
+                handle(agent, {}, {})
+
+        prompts = {}
+        for call in client.calls:
+            text = "".join(
+                part.get("text", "") for part in call[0]["content"] if part.get("type") == "text"
+            )
+            match = re.search(r"第\s*(\d)\s*题", text)
+            if match:
+                prompts[int(match.group(1))] = text
+        self.assertIn(1, prompts)
+        self.assertIn("像素统计", prompts[1])
+        self.assertIn("五边形", prompts[1])
+        self.assertIn("矩阵（行,列）", prompts[1])
+
+    def test_raven_measure_keeps_four_objects_and_position_slots(self) -> None:
+        """Q3 的 3/4 图形格不得再被截成最多两个。"""
+        from arenaagent.preliminary_baseline_agent.tasks.raven.measure import describe_shapes
+
+        panel = _synthetic_raven_panel()
+        draw = ImageDraw.Draw(panel)
+        draw.rectangle([54, 812, 208, 966], fill="white", outline="black", width=3)
+        for x, y in ((82, 840), (150, 840), (82, 908), (150, 908)):
+            draw.ellipse([x, y, x + 32, y + 32], fill="gray", outline="black", width=2)
+
+        description = describe_shapes(panel, 3)
+
+        self.assertIn("1. 【共4个】", description)
+        self.assertIn("[左上]", description)
+        self.assertIn("[右下]", description)
+
+    def test_raven_pure_vision_refuses_an_unparsable_answer(self) -> None:
+        """拿不到三个 1~8 的编号就不要提交，避免把噪声当成答案。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            canvas = Path(tmp) / "canvas.png"
+            Image.new("RGB", (600, 300), "white").save(canvas)
+            agent = _PureVisionAgent(str(canvas))
+            agent.vlm_client = _FakeVisionClient("这三道题我无法判断。")
+
+            with patch.dict(
+                os.environ,
+                {"RAVEN_PURE_VISION": "1", "RAVEN_VISION_PASSES": "1"},
+            ):
+                result = handle(agent, {}, {})
+
+        self.assertEqual(result.get("result"), "failed")
 
     def test_canvas_crop_stays_in_memory_by_default(self) -> None:
         fake_groups = [[Image.new("RGB", (32, 32), "white") for _ in range(16)] for _ in range(3)]

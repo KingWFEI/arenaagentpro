@@ -1,4 +1,5 @@
 import hashlib
+import os
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -56,6 +57,26 @@ class AgentBase(ABC):
         self.channel = channel
         self.cfg = cfg.copy() if cfg is not None else AgentCfg()
         self.sleep_between_steps = sleep_between_steps
+        # 提交答案后等待赛题端结算的轮询间隔：结算本身只要几秒，1 秒粒度
+        # 每道题都要多等半秒左右。按时间效率计分的题（计数/NPC/瑞文）值得调细。
+        try:
+            self.session_poll_seconds = max(
+                0.0, float(os.getenv("ARENA_SESSION_POLL_SECONDS", "0.2"))
+            )
+        except ValueError:
+            self.session_poll_seconds = 0.2
+        # 任务策略确认本题已被赛题端结算后（见 subject_settled）也不能马上断开：
+        # 赛题端要等所有 agent 都停手才跑评测，评测时要求 agent 仍在 EVALUATING 状态。
+        # 实测（09-20 18:02）用 3 秒的提前重连，赛题端在 0.87 秒后开始评测，直接报
+        # "Agent ... is not in EVALUATING state during evaluation" 并**跳过记分**——
+        # 答对的题白答。正确做法是等 session 进终态（实测约 16 秒），这里给到 25 秒兜底。
+        try:
+            self.settle_grace_seconds = max(
+                0.0, float(os.getenv("ARENA_SETTLE_GRACE_SECONDS", "25"))
+            )
+        except ValueError:
+            self.settle_grace_seconds = 25.0
+        self.subject_settled = False
         self.agent_id = uuid.uuid4().hex[:10]
         self.action_space: dict[str, Any] = {}
         self.connected = False
@@ -110,6 +131,14 @@ class AgentBase(ABC):
         self._run_subject()
         # self._evaluate_task()
 
+        # 提交后要等 session 进入终态才能断开：实测赛题端只有在**答对**时才结束
+        # 当前这道题，答错时题目一直挂着。此时断开重连不会跳到下一题——新 agent
+        # 会被当成同一道题的又一次作答（实测 5 个 agent 全在答 subject 1，还多付了
+        # 5 次 15 秒等待）。要推进只能继续作答，见 _run_raven_subject_safely。
+        #
+        # 例外：任务策略已确认本题被结算（subject_settled）时可以提前走——那时
+        # 赛题端已经打完分，只是还没把 session 置为终态（实测这道流程要 16 秒）。
+        skip_deadline: float | None = None
         while True:
             session_status = self._get_task_status().get("session_status")
             logger.debug(f"Current session status: {session_status}")
@@ -120,7 +149,17 @@ class AgentBase(ABC):
             ):
                 logger.info(f"finished work Current session status: {session_status}")
                 break
-            time.sleep(1)
+            if self.subject_settled:
+                if skip_deadline is None:
+                    skip_deadline = time.monotonic() + self.settle_grace_seconds
+                    logger.info(
+                        "Subject already settled; giving the arena {}s before reconnecting",
+                        self.settle_grace_seconds,
+                    )
+                elif time.monotonic() >= skip_deadline:
+                    logger.info("Reconnecting without waiting for the terminal session status")
+                    break
+            time.sleep(self.session_poll_seconds)
 
         self._disconnect()
 
